@@ -23,7 +23,6 @@ from qdrant_client.models import (
     FieldCondition,
     Filter,
     MatchValue,
-    NamedVector,
     PointStruct,
     VectorParams,
 )
@@ -177,13 +176,14 @@ class VectorDB:
             if weight == 0.0:
                 continue
 
-            results = self.client.search(
+            results = self.client.query_points(
                 collection_name=self._collection_name(model_id),
-                query_vector=NamedVector(name=f"layer_{layer}", vector=q_vec.tolist()),
+                query=q_vec.tolist(),
+                using=f"layer_{layer}",
                 limit=top_k,
                 query_filter=qdrant_filter,
                 with_vectors=False,
-            )
+            ).points
             for r in results:
                 bid = str(r.id)
                 candidate_scores[bid] = candidate_scores.get(bid, 0.0) + weight * r.score
@@ -241,15 +241,13 @@ class VectorDB:
         Returns block_id of the duplicate if found, else None.
         Uses the middle retrieval layer as the representative vector.
         """
-        results = self.client.search(
+        results = self.client.query_points(
             collection_name=self._collection_name(model_id),
-            query_vector=NamedVector(
-                name=f"layer_{layer}",
-                vector=hidden_vec.tolist(),
-            ),
+            query=hidden_vec.tolist(),
+            using=f"layer_{layer}",
             limit=1,
             score_threshold=threshold,
-        )
+        ).points
         return str(results[0].id) if results else None
 
     # ------------------------------------------------------------------
