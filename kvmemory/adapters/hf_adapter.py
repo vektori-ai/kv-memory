@@ -144,30 +144,39 @@ class HFAdapter(BaseAdapter):
         generation_kwargs: dict,
     ) -> GenerationOutput:
         """
-        Dequantize stored KV blocks and prepend as past_key_values.
+        Dequantize stored KV blocks and prepend as past_key_values, then generate.
 
-        Doc-wise RoPE: each block's KV was captured with positions [0..n],
-        so no re-rotation is needed. The model sees them as independent
-        documents. Query tokens get positions starting at len(blocks).
+        When blocks are provided: uses a manual prefill + decode loop with explicit
+        position_ids. This bypasses transformers.generate() which has breaking
+        changes in 4.40+ for legacy past_key_values formats.
 
-        If no blocks are provided, falls back to plain generation.
+        When no blocks: delegates to model.generate() normally.
+
+        Doc-wise RoPE: query tokens start at position = total_past_tokens,
+        placing them correctly after all injected context regardless of which
+        layers have stored KV.
         """
         if not current_tokens:
             raise ValueError("inject_and_generate() called with empty current_tokens")
 
-        combined_kv = self._build_past_key_values(blocks)
         input_ids = torch.tensor([current_tokens], dtype=torch.long).to(self.model.device)
 
-        gen_kwargs = dict(generation_kwargs)  # copy to avoid mutation
-        if combined_kv is not None:
-            gen_kwargs["past_key_values"] = combined_kv
+        if not blocks:
+            # No injection — use generate() directly, no API issues
+            with torch.no_grad():
+                out = self.model.generate(input_ids=input_ids, **dict(generation_kwargs))
+            sequences = out.tolist()
+            text = self._tokenizer.decode(sequences[0], skip_special_tokens=True)
+            return GenerationOutput(sequences=sequences, text=text)
 
-        with torch.no_grad():
-            out = self.model.generate(input_ids=input_ids, **gen_kwargs)
-
-        sequences = out.tolist()  # [batch, seq]
-        text = self._tokenizer.decode(sequences[0], skip_special_tokens=True)
-        return GenerationOutput(sequences=sequences, text=text)
+        # KV injection path: manual decode loop to avoid transformers version issues
+        past_kv, total_past_tokens = self._build_cache(blocks)
+        return self._manual_generate(
+            input_ids=input_ids,
+            past_kv=past_kv,
+            position_offset=total_past_tokens,
+            generation_kwargs=generation_kwargs,
+        )
 
     def generate(
         self,
@@ -183,25 +192,30 @@ class HFAdapter(BaseAdapter):
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _build_past_key_values(
+    def _build_cache(
         self,
         blocks: list[KVBlock],
-    ) -> Optional[list[tuple[torch.Tensor, torch.Tensor]]]:
+    ) -> tuple[object, int]:
         """
-        Assemble past_key_values from a list of KVBlocks.
+        Assemble a KV cache from a list of KVBlocks.
 
-        For each layer, concatenate K and V from all blocks that have
-        that layer stored. Dequantizes int8 -> float16 on the fly.
+        Builds a DynamicCache (transformers >= 4.38) when available.
+        Falls back to legacy tuple-of-tuples for older versions.
 
-        Returns None if no blocks have any KV data.
+        Every layer gets an entry: real KV for stored layers, empty tensors
+        for unstored layers. This ensures consistent cache_position accounting
+        across all layers regardless of which layers have stored KV.
+
+        Returns:
+            (past_key_values, total_past_tokens)
+            total_past_tokens: sum of token counts across all injected blocks,
+                               used to set cache_position for the query.
         """
-        if not blocks:
-            return None
+        head_dim = self._d_model // self._num_heads
+        total_past_tokens = sum(b.token_count for b in blocks)
 
-        combined: list[Optional[tuple[torch.Tensor, torch.Tensor]]] = [
-            None
-        ] * self._num_layers
-
+        # Build per-layer (K_cat, V_cat) — empty tensors for unstored layers
+        layer_kvs: list[tuple[torch.Tensor, torch.Tensor]] = []
         for layer_idx in range(self._num_layers):
             K_parts: list[torch.Tensor] = []
             V_parts: list[torch.Tensor] = []
@@ -211,24 +225,110 @@ class HFAdapter(BaseAdapter):
                     continue
                 K_q, V_q = block.kv_by_layer[layer_idx]
                 k_scale, v_scale = block.quant_scales[layer_idx]
-
-                # Dequantize: int8 -> float32 -> scale -> float16
                 K = torch.from_numpy(K_q.astype(np.float32)) * k_scale
                 V = torch.from_numpy(V_q.astype(np.float32)) * v_scale
                 K = K.to(dtype=torch.float16, device=self.model.device)
                 V = V.to(dtype=torch.float16, device=self.model.device)
-                K_parts.append(K)   # [heads, seq_i, head_dim]
+                K_parts.append(K)  # [heads, seq_i, head_dim]
                 V_parts.append(V)
 
             if K_parts:
-                # Concatenate along seq dim, then add batch dim
                 K_cat = torch.cat(K_parts, dim=1).unsqueeze(0)  # [1, heads, total_seq, head_dim]
                 V_cat = torch.cat(V_parts, dim=1).unsqueeze(0)
-                combined[layer_idx] = (K_cat, V_cat)
+            else:
+                # Empty placeholder: 0-length seq so the layer has no prior context
+                K_cat = torch.zeros(1, self._num_heads, 0, head_dim,
+                                    dtype=torch.float16, device=self.model.device)
+                V_cat = torch.zeros(1, self._num_heads, 0, head_dim,
+                                    dtype=torch.float16, device=self.model.device)
 
-        # Only return if at least one layer has data
-        if any(x is not None for x in combined):
-            # Fill None slots with empty tensors at correct shapes so HF doesn't break
-            # We only need layers that exist in the model
-            return combined
-        return None
+            layer_kvs.append((K_cat, V_cat))
+
+        # Always use the legacy tuple format for the manual decode loop.
+        # model() forward accepts both legacy tuples and DynamicCache equally,
+        # and the manual loop doesn't have the generate() API incompatibilities.
+        return tuple(layer_kvs), total_past_tokens
+
+    def _manual_generate(
+        self,
+        input_ids: torch.Tensor,
+        past_kv: tuple,
+        position_offset: int,
+        generation_kwargs: dict,
+    ) -> "GenerationOutput":
+        """
+        Manual prefill + greedy/sampling decode loop with explicit position_ids.
+
+        Handles: max_new_tokens, do_sample, temperature, top_p, eos_token_id.
+        Called only when KV blocks are injected.
+        """
+        max_new_tokens: int = generation_kwargs.get("max_new_tokens", 20)
+        do_sample: bool = generation_kwargs.get("do_sample", False)
+        temperature: float = float(generation_kwargs.get("temperature", 1.0))
+        top_p: float = float(generation_kwargs.get("top_p", 1.0))
+        eos_id = generation_kwargs.get(
+            "eos_token_id",
+            getattr(self._tokenizer, "eos_token_id", None),
+        )
+
+        seq_len = input_ids.shape[1]
+        generated: list[int] = input_ids[0].tolist()
+
+        # Prefill: process all query tokens with injected KV context
+        pos_ids = torch.arange(
+            position_offset, position_offset + seq_len, device=self.model.device
+        ).unsqueeze(0)  # [1, seq]
+
+        with torch.no_grad():
+            fwd = self.model(
+                input_ids=input_ids,
+                past_key_values=past_kv,
+                position_ids=pos_ids,
+                use_cache=True,
+            )
+
+        current_pkv = fwd.past_key_values
+        next_pos = position_offset + seq_len
+
+        # Autoregressive decode
+        for _ in range(max_new_tokens):
+            logits = fwd.logits[0, -1, :]  # [vocab]
+
+            if do_sample:
+                logits = logits / max(temperature, 1e-8)
+                if top_p < 1.0:
+                    logits = self._top_p_filter(logits, top_p)
+                probs = torch.softmax(logits, dim=-1)
+                next_token = int(torch.multinomial(probs, num_samples=1).item())
+            else:
+                next_token = int(logits.argmax().item())
+
+            generated.append(next_token)
+            if eos_id is not None and next_token == eos_id:
+                break
+
+            step_ids = torch.tensor([[next_token]], device=self.model.device)
+            step_pos = torch.tensor([[next_pos]], device=self.model.device)
+            with torch.no_grad():
+                fwd = self.model(
+                    input_ids=step_ids,
+                    past_key_values=current_pkv,
+                    position_ids=step_pos,
+                    use_cache=True,
+                )
+            current_pkv = fwd.past_key_values
+            next_pos += 1
+
+        text = self._tokenizer.decode(generated, skip_special_tokens=True)
+        return GenerationOutput(sequences=[generated], text=text)
+
+    @staticmethod
+    def _top_p_filter(logits: torch.Tensor, top_p: float) -> torch.Tensor:
+        """Zero out logits below the nucleus (top-p) threshold."""
+        sorted_logits, sorted_idx = torch.sort(logits, descending=True)
+        cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+        # Remove tokens once cumulative prob exceeds top_p
+        remove_mask = cumulative_probs - torch.softmax(sorted_logits, dim=-1) > top_p
+        sorted_logits[remove_mask] = float("-inf")
+        # Scatter back to original order
+        return logits.scatter(0, sorted_idx, sorted_logits)

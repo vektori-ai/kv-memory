@@ -101,6 +101,8 @@ class MockAdapter(BaseAdapter):
         text: str,
         layers: list[int],
     ):
+        if not tokens:
+            raise ValueError("capture() called with empty token list")
         seq_len = len(tokens)
         # Deterministic tensors based on sum of tokens (reproducible)
         seed = sum(tokens) % 1000

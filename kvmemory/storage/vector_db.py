@@ -261,13 +261,22 @@ class VectorDB:
         collection_name = self._collection_name(model_id)
         for bid in block_ids:
             try:
+                results = self.client.retrieve(
+                    collection_name=collection_name,
+                    ids=[bid],
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                if not results:
+                    continue
+                current = (results[0].payload or {}).get("access_count", 0) or 0
                 self.client.set_payload(
                     collection_name=collection_name,
-                    payload={"access_count": None},  # will be fetched and incremented below
+                    payload={"access_count": current + 1},
                     points=[bid],
                 )
             except Exception as e:
-                logger.debug("increment_access_count: %s", e)
+                logger.debug("increment_access_count failed for %s: %s", bid, e)
 
     # ------------------------------------------------------------------
     # Internal
@@ -287,7 +296,11 @@ class VectorDB:
         Build a Qdrant filter that enforces model_id and optional session constraints.
 
         model_id enforcement is non-negotiable per the spec.
-        session_filter can add session_id, agent_id, shared constraints.
+
+        Logic:
+          - Always: model_id == this
+          - retrieve_shared=False: AND session_id == this
+          - retrieve_shared=True:  AND (session_id == this OR shared == True)
         """
         must: list[FieldCondition] = [
             FieldCondition(key="model_id", match=MatchValue(value=model_id))
@@ -295,16 +308,24 @@ class VectorDB:
 
         if session_filter:
             session_id = session_filter.get("session_id")
-            agent_id = session_filter.get("agent_id")
             retrieve_shared = session_filter.get("retrieve_shared", False)
 
-            if session_id and not retrieve_shared:
-                # Only return blocks from this session, OR shared blocks
-                # We implement this as: session_id == this OR shared == True
-                # Qdrant doesn't have OR at top level easily, so we use should
-                # (skip strict filtering for now — let MMR handle diversity)
-                must.append(
-                    FieldCondition(key="session_id", match=MatchValue(value=session_id))
-                )
+            if session_id:
+                if not retrieve_shared:
+                    # Strict: only this session
+                    must.append(
+                        FieldCondition(key="session_id", match=MatchValue(value=session_id))
+                    )
+                else:
+                    # OR: this session's blocks + any shared block
+                    # Qdrant: must (model_id) + should (session_id OR shared=True)
+                    # When both must and should are present, should acts as "at least one"
+                    return Filter(
+                        must=must,
+                        should=[
+                            FieldCondition(key="session_id", match=MatchValue(value=session_id)),
+                            FieldCondition(key="shared", match=MatchValue(value=True)),
+                        ],
+                    )
 
         return Filter(must=must)

@@ -325,7 +325,16 @@ class TestHFAdapterReal:
             assert K.shape[1] == len(tokens)
 
     def test_kv_injection_changes_output(self, hf_adapter, hf_config, tmp_path):
-        """Core correctness test: injection must change output."""
+        """Core correctness test: injection must change model logits.
+
+        We assert on the prefill logits rather than final sequences because
+        tiny-gpt2 (hidden_size=2) is degenerate — it collapses to the same
+        argmax token regardless of context. Real models (Llama, Mistral) will
+        produce different token sequences. The logit check is the correct
+        invariant: injection must change what the model computes.
+        """
+        import torch
+
         text = "The capital of France is Paris."
         tokens = hf_adapter.tokenizer.encode(text)
 
@@ -359,12 +368,28 @@ class TestHFAdapterReal:
         )
 
         query_tokens = hf_adapter.tokenizer.encode("What is the capital?")
-        gen_kwargs = {"max_new_tokens": 10, "do_sample": False}
+        q_inp = torch.tensor([query_tokens]).to(hf_adapter.model.device)
 
-        out_without = hf_adapter.inject_and_generate([], query_tokens, gen_kwargs)
-        out_with = hf_adapter.inject_and_generate([block], query_tokens, gen_kwargs)
+        # Compare prefill logits with and without injected KV
+        past_kv, offset = hf_adapter._build_cache([block])
+        pos_ids = torch.arange(offset, offset + len(query_tokens),
+                               device=hf_adapter.model.device).unsqueeze(0)
 
-        # Outputs should differ when KV context is injected
-        assert out_without.sequences[0] != out_with.sequences[0], (
-            "KV injection did not change output — injection may not be working"
+        with torch.no_grad():
+            logits_with = hf_adapter.model(
+                q_inp, past_key_values=past_kv, position_ids=pos_ids, use_cache=False
+            ).logits
+            logits_without = hf_adapter.model(q_inp, use_cache=False).logits
+
+        max_diff = (logits_with - logits_without).abs().max().item()
+        assert max_diff > 1e-4, (
+            f"KV injection did not change model logits (max_diff={max_diff:.6f}) "
+            "— injection may not be working"
         )
+
+        # Also verify the injection path runs end-to-end without crashing
+        gen_kwargs = {"max_new_tokens": 5, "do_sample": False}
+        out = hf_adapter.inject_and_generate([block], query_tokens, gen_kwargs)
+        assert out is not None
+        assert len(out.sequences[0]) > len(query_tokens), "No tokens were generated"
+        assert isinstance(out.text, str)

@@ -152,6 +152,8 @@ class KVMemory:
             len(blocks),
             sum(b.token_count for b in blocks),
         )
+        if final_ids:
+            asyncio.ensure_future(self._increment_access_counts(final_ids))
 
         # --- GENERATE ---
         output = inject_and_generate(
@@ -171,6 +173,9 @@ class KVMemory:
             text=full_turn,
             adapter=self.adapter,
             config=self.config,
+            agent_id=agent_id,
+            shared=False,
+            explicit_signal=explicit_signal,
         )
 
         return output
@@ -196,6 +201,9 @@ class KVMemory:
             text=text,
             adapter=self.adapter,
             config=self.config,
+            agent_id=agent_id,
+            shared=shared,
+            explicit_signal=explicit_signal,
         )
 
     async def close(self) -> None:
@@ -213,6 +221,9 @@ class KVMemory:
         text: str,
         adapter: BaseAdapter,
         config: KVMemoryConfig,
+        agent_id: Optional[str] = None,
+        shared: bool = False,
+        explicit_signal: float = 0.0,
     ) -> None:
         """Write pipeline entrypoint called by the queue worker."""
         await run_write_pipeline(
@@ -223,4 +234,14 @@ class KVMemory:
             config=config,
             kv_store=self.kv_store,
             vector_db=self.vector_db,
+            agent_id=agent_id,
+            shared=shared,
+            explicit_signal=explicit_signal,
         )
+
+    async def _increment_access_counts(self, block_ids: list[str]) -> None:
+        """Fire-and-forget: increment access counts in vector DB after retrieval."""
+        try:
+            self.vector_db.increment_access_count(self.config.model_id, block_ids)
+        except Exception as e:
+            logger.debug("Failed to increment access counts in vector DB: %s", e)
