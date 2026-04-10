@@ -23,7 +23,9 @@ from qdrant_client.models import (
     FieldCondition,
     Filter,
     MatchValue,
+    MatchText,
     PointStruct,
+    Range,
     VectorParams,
 )
 
@@ -100,6 +102,7 @@ class VectorDB:
         token_count: int,
         chunk_text: str,
         importance_score: float,
+        trace_payload: Optional[dict] = None,
     ) -> None:
         """
         Insert or update a KVBlock's retrieval entry.
@@ -123,7 +126,13 @@ class VectorDB:
             "created_at": time.time(),
             "importance_score": importance_score,
             "access_count": 0,
+            "retrieval_layers": sorted(hidden_vecs),
         }
+        payload.update({
+            key: value
+            for key, value in (trace_payload or {}).items()
+            if value is not None and key not in {"chunk_index", "total_chunks"}
+        })
 
         self.client.upsert(
             collection_name=collection_name,
@@ -234,19 +243,26 @@ class VectorDB:
         hidden_vec: np.ndarray,
         layer: int,
         threshold: float = 0.95,
+        session_id: Optional[str] = None,
     ) -> Optional[str]:
         """
-        Check if a near-identical block already exists.
+        Check if a near-identical block already exists within the same session.
 
         Returns block_id of the duplicate if found, else None.
-        Uses the middle retrieval layer as the representative vector.
+        session_id scoping is required: without it, blocks from previous eval runs
+        or other sessions would be treated as duplicates of current session content.
         """
+        qdrant_filter = self._build_filter(
+            model_id,
+            {"session_id": session_id} if session_id else None,
+        )
         results = self.client.query_points(
             collection_name=self._collection_name(model_id),
             query=hidden_vec.tolist(),
             using=f"layer_{layer}",
             limit=1,
             score_threshold=threshold,
+            query_filter=qdrant_filter,
         ).points
         return str(results[0].id) if results else None
 
@@ -270,11 +286,92 @@ class VectorDB:
                 current = (results[0].payload or {}).get("access_count", 0) or 0
                 self.client.set_payload(
                     collection_name=collection_name,
-                    payload={"access_count": current + 1},
+                    payload={"access_count": current + 1, "last_accessed_at": time.time()},
                     points=[bid],
                 )
             except Exception as e:
                 logger.debug("increment_access_count failed for %s: %s", bid, e)
+
+    def list_collections(self) -> list[dict]:
+        """Return lightweight collection metadata for dashboard browsing."""
+        collections = []
+        for collection in self.client.get_collections().collections:
+            info = self.client.get_collection(collection.name)
+            collections.append(
+                {
+                    "name": collection.name,
+                    "status": str(getattr(info, "status", "")),
+                    "points_count": getattr(info, "points_count", None),
+                    "indexed_vectors_count": getattr(info, "indexed_vectors_count", None),
+                    "vectors_count": getattr(info, "vectors_count", None),
+                }
+            )
+        return collections
+
+    def scroll_points(
+        self,
+        *,
+        collection_name: str,
+        limit: int = 100,
+        offset: Optional[str] = None,
+        with_vectors: bool = False,
+        run_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        question_id: Optional[str] = None,
+        phase: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        shared: Optional[bool] = None,
+        importance_min: Optional[float] = None,
+        importance_max: Optional[float] = None,
+        token_count_min: Optional[int] = None,
+        token_count_max: Optional[int] = None,
+        created_after: Optional[float] = None,
+        created_before: Optional[float] = None,
+        text_contains: Optional[str] = None,
+        layer: Optional[int] = None,
+    ) -> dict:
+        qdrant_filter = self._build_dashboard_filter(
+            run_id=run_id,
+            session_id=session_id,
+            question_id=question_id,
+            phase=phase,
+            agent_id=agent_id,
+            shared=shared,
+            importance_min=importance_min,
+            importance_max=importance_max,
+            token_count_min=token_count_min,
+            token_count_max=token_count_max,
+            created_after=created_after,
+            created_before=created_before,
+            text_contains=text_contains,
+        )
+        records, next_offset = self.client.scroll(
+            collection_name=collection_name,
+            scroll_filter=qdrant_filter,
+            limit=limit,
+            offset=offset,
+            with_payload=True,
+            with_vectors=with_vectors,
+        )
+
+        points = []
+        for record in records:
+            payload = record.payload or {}
+            if layer is not None and layer not in payload.get("retrieval_layers", []):
+                continue
+            points.append(
+                {
+                    "id": str(record.id),
+                    "payload": payload,
+                    "vector": record.vector if with_vectors else None,
+                }
+            )
+
+        return {
+            "collection": collection_name,
+            "points": points,
+            "next_offset": str(next_offset) if next_offset is not None else None,
+        }
 
     # ------------------------------------------------------------------
     # Internal
@@ -326,4 +423,63 @@ class VectorDB:
                         ],
                     )
 
+        return Filter(must=must)
+
+    @staticmethod
+    def _build_dashboard_filter(
+        *,
+        run_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        question_id: Optional[str] = None,
+        phase: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        shared: Optional[bool] = None,
+        importance_min: Optional[float] = None,
+        importance_max: Optional[float] = None,
+        token_count_min: Optional[int] = None,
+        token_count_max: Optional[int] = None,
+        created_after: Optional[float] = None,
+        created_before: Optional[float] = None,
+        text_contains: Optional[str] = None,
+    ) -> Optional[Filter]:
+        must: list[FieldCondition] = []
+
+        if run_id:
+            must.append(FieldCondition(key="run_id", match=MatchValue(value=run_id)))
+        if session_id:
+            must.append(FieldCondition(key="session_id", match=MatchValue(value=session_id)))
+        if question_id:
+            must.append(FieldCondition(key="question_id", match=MatchValue(value=question_id)))
+        if phase:
+            must.append(FieldCondition(key="phase", match=MatchValue(value=phase)))
+        if agent_id:
+            must.append(FieldCondition(key="agent_id", match=MatchValue(value=agent_id)))
+        if shared is not None:
+            must.append(FieldCondition(key="shared", match=MatchValue(value=shared)))
+        if importance_min is not None or importance_max is not None:
+            must.append(
+                FieldCondition(
+                    key="importance_score",
+                    range=Range(gte=importance_min, lte=importance_max),
+                )
+            )
+        if token_count_min is not None or token_count_max is not None:
+            must.append(
+                FieldCondition(
+                    key="token_count",
+                    range=Range(gte=token_count_min, lte=token_count_max),
+                )
+            )
+        if created_after is not None or created_before is not None:
+            must.append(
+                FieldCondition(
+                    key="created_at",
+                    range=Range(gte=created_after, lte=created_before),
+                )
+            )
+        if text_contains:
+            must.append(FieldCondition(key="chunk_text", match=MatchText(text=text_contains)))
+
+        if not must:
+            return None
         return Filter(must=must)

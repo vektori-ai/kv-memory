@@ -17,8 +17,8 @@ Write path: async, enqueued, never blocks generation
 from __future__ import annotations
 
 import asyncio
-import functools
 import logging
+import time
 from typing import Optional
 
 from .adapters.base import BaseAdapter
@@ -27,6 +27,7 @@ from .core.injector import inject_and_generate
 from .core.queue import WriteQueue
 from .core.retrieval import compute_query_vecs, stage1_coarse, stage2_rerank_mmr
 from .core.write_pipeline import run_write_pipeline
+from .observability import RunObserver
 from .storage.kv_store import KVStore
 from .storage.schema import GenerationOutput
 from .storage.vector_db import VectorDB
@@ -70,9 +71,15 @@ class KVMemory:
         output = await memory.generate("What is the capital of France?", session_id='user_123')
     """
 
-    def __init__(self, adapter: BaseAdapter, config: KVMemoryConfig) -> None:
+    def __init__(
+        self,
+        adapter: BaseAdapter,
+        config: KVMemoryConfig,
+        observer: Optional[RunObserver] = None,
+    ) -> None:
         self.adapter = adapter
         self.config = config
+        self.observer = observer
 
         self.vector_db = VectorDB(url=config.qdrant_url, port=config.qdrant_port)
         self.kv_store = KVStore(blob_store_path=config.blob_store_path)
@@ -99,6 +106,7 @@ class KVMemory:
         retrieve_shared: bool = False,
         generation_kwargs: Optional[dict] = None,
         explicit_signal: float = 0.0,
+        trace_context: Optional[dict] = None,
     ) -> GenerationOutput:
         """
         Full cycle: retrieve -> generate -> enqueue write.
@@ -116,6 +124,14 @@ class KVMemory:
         """
         if generation_kwargs is None:
             generation_kwargs = {}
+        observer = None
+        if self.observer:
+            observer = self.observer.child(
+                session_id=session_id,
+                agent_id=agent_id,
+                retrieve_shared=retrieve_shared,
+                **(trace_context or {}),
+            )
 
         tokens = self.adapter.tokenizer.encode(prompt)
         if not tokens:
@@ -129,6 +145,7 @@ class KVMemory:
             retrieve_shared=retrieve_shared,
         )
 
+        stage1_start = time.perf_counter()
         candidate_ids, query_vecs = await stage1_coarse(
             query_tokens=tokens,
             adapter=self.adapter,
@@ -136,7 +153,17 @@ class KVMemory:
             vector_db=self.vector_db,
             session_filter=session_filter,
         )
+        stage1_ms = (time.perf_counter() - stage1_start) * 1000
+        if observer:
+            observer.emit(
+                "retrieval_stage1_done",
+                phase=(trace_context or {}).get("phase", "generate"),
+                duration_ms=stage1_ms,
+                candidate_count=len(candidate_ids),
+                query_token_count=len(tokens),
+            )
 
+        stage2_start = time.perf_counter()
         final_ids = stage2_rerank_mmr(
             candidate_ids=candidate_ids,
             query_vecs=query_vecs,
@@ -144,24 +171,53 @@ class KVMemory:
             vector_db=self.vector_db,
             token_budget=self.config.token_budget,
         )
+        stage2_ms = (time.perf_counter() - stage2_start) * 1000
+        if observer:
+            observer.emit(
+                "retrieval_stage2_done",
+                phase=(trace_context or {}).get("phase", "generate"),
+                duration_ms=stage2_ms,
+                selected_count=len(final_ids),
+                selected_ids=final_ids,
+            )
 
+        fetch_start = time.perf_counter()
         blocks = self.kv_store.fetch(final_ids, model_id=self.config.model_id)
+        fetch_ms = (time.perf_counter() - fetch_start) * 1000
         logger.info(
             "generate: session=%s, retrieved=%d blocks, tokens_in_context=%d",
             session_id,
             len(blocks),
             sum(b.token_count for b in blocks),
         )
+        if observer:
+            observer.emit(
+                "kv_fetch_done",
+                phase=(trace_context or {}).get("phase", "generate"),
+                duration_ms=fetch_ms,
+                block_count=len(blocks),
+                token_count=sum(b.token_count for b in blocks),
+                block_ids=final_ids,
+            )
         if final_ids:
             asyncio.ensure_future(self._increment_access_counts(final_ids))
 
         # --- GENERATE ---
+        generation_start = time.perf_counter()
         output = inject_and_generate(
             adapter=self.adapter,
             blocks=blocks,
             current_tokens=tokens,
             generation_kwargs=generation_kwargs,
         )
+        generation_ms = (time.perf_counter() - generation_start) * 1000
+        if observer:
+            observer.emit(
+                "generation_done",
+                phase=(trace_context or {}).get("phase", "generate"),
+                duration_ms=generation_ms,
+                output_chars=len(output.text),
+            )
 
         # --- WRITE (async, non-blocking) ---
         response_text = output.text
@@ -176,7 +232,16 @@ class KVMemory:
             agent_id=agent_id,
             shared=False,
             explicit_signal=explicit_signal,
+            observer=observer,
+            trace_context=trace_context,
         )
+        if observer:
+            observer.emit(
+                "write_enqueued",
+                phase=(trace_context or {}).get("phase", "generate"),
+                token_count=len(tokens),
+                queue_depth=self._write_queue.pending,
+            )
 
         return output
 
@@ -187,6 +252,7 @@ class KVMemory:
         agent_id: Optional[str] = None,
         shared: bool = False,
         explicit_signal: float = 1.0,
+        trace_context: Optional[dict] = None,
     ) -> None:
         """
         Manually store text into memory without generating a response.
@@ -195,6 +261,14 @@ class KVMemory:
         explicit_signal=1.0 bypasses the importance filter.
         """
         tokens = self.adapter.tokenizer.encode(text)
+        observer = None
+        if self.observer:
+            observer = self.observer.child(
+                session_id=session_id,
+                agent_id=agent_id,
+                shared=shared,
+                **(trace_context or {}),
+            )
         await self._write_queue.enqueue(
             session_id=session_id,
             tokens=tokens,
@@ -204,7 +278,16 @@ class KVMemory:
             agent_id=agent_id,
             shared=shared,
             explicit_signal=explicit_signal,
+            observer=observer,
+            trace_context=trace_context,
         )
+        if observer:
+            observer.emit(
+                "write_enqueued",
+                phase=(trace_context or {}).get("phase", "store"),
+                token_count=len(tokens),
+                queue_depth=self._write_queue.pending,
+            )
 
     async def close(self) -> None:
         """Drain pending writes and shut down the write queue."""
@@ -224,6 +307,8 @@ class KVMemory:
         agent_id: Optional[str] = None,
         shared: bool = False,
         explicit_signal: float = 0.0,
+        observer: Optional[RunObserver] = None,
+        trace_context: Optional[dict] = None,
     ) -> None:
         """Write pipeline entrypoint called by the queue worker."""
         await run_write_pipeline(
@@ -237,6 +322,8 @@ class KVMemory:
             agent_id=agent_id,
             shared=shared,
             explicit_signal=explicit_signal,
+            observer=observer,
+            trace_context=trace_context,
         )
 
     async def _increment_access_counts(self, block_ids: list[str]) -> None:

@@ -2,7 +2,7 @@
 beam_eval.py — BEAM benchmark runner. Phase 3.
 
 Measures:
-  - Answer accuracy per question type (IE, multi-hop, knowledge update, temporal)
+  - Answer accuracy per question type
   - Prefill token count per turn vs RAG baseline (cost reduction metric)
   - Per-stage latency breakdown (stage1 ANN, stage2 MMR, fetch, inject+generate)
 
@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import json
 import logging
 import time
@@ -38,12 +39,12 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Question types defined by BEAM (subset our plan targets)
+# Dataset-native BEAM question types used by this benchmark.
 QUESTION_TYPES = [
     "information_extraction",
-    "multi_hop",
     "knowledge_update",
-    "temporal",
+    "multi_session_reasoning",
+    "temporal_reasoning",
 ]
 
 
@@ -130,9 +131,10 @@ def load_beam_hf(
     Load BEAM dataset from HuggingFace (Mohammadta/BEAM).
 
     Schema (one row = one full conversation):
-      - chat:              list of {role, content, time_anchor, ...} dicts
+      - chat:              list of sessions, each session is a list of
+                           {role, content, time_anchor, ...} dicts
       - probing_questions: Python-string-serialized dict keyed by question type,
-                           each value is a list of {question, answer} dicts
+                           each value is a list of question dicts
       - conversation_id:   string
 
     Args:
@@ -154,36 +156,29 @@ def load_beam_hf(
     if question_types is None:
         question_types = QUESTION_TYPES
 
-    # Map friendly names to HF-internal type labels (lowercase with spaces)
-    _type_aliases = {
-        "information_extraction": ["information extraction", "information_extraction"],
-        "multi_hop":              ["multi-hop reasoning", "multi_hop", "multi hop"],
-        "knowledge_update":       ["knowledge update", "knowledge_update"],
-        "temporal":               ["temporal reasoning", "temporal"],
-    }
-    # Build a flat lookup: any alias -> canonical name
-    _alias_map: dict[str, str] = {}
-    for canonical, aliases in _type_aliases.items():
-        for alias in aliases:
-            _alias_map[alias.lower()] = canonical
-        _alias_map[canonical.lower()] = canonical
-
     logger.info("Loading BEAM dataset (scale=%s) from HuggingFace...", scale)
     ds = load_dataset("Mohammadta/BEAM", split=scale)
 
     questions: list[BEAMQuestion] = []
+    selected_types = {qt.lower().strip() for qt in question_types}
 
     for row in ds:
         conv_id = str(row.get("conversation_id", f"conv_{len(questions)}"))
 
-        # Build context: join all chat messages
+        # Build context from nested chat sessions.
         chat = row.get("chat", [])
         context_parts = []
-        for msg in chat:
-            role = msg.get("role", "")
-            content = msg.get("content", "")
-            if content:
-                context_parts.append(f"{role.capitalize()}: {content}")
+        for session in chat:
+            if not isinstance(session, list):
+                continue
+            for msg in session:
+                if not isinstance(msg, dict):
+                    continue
+                role = str(msg.get("role", "")).strip()
+                content = str(msg.get("content", "")).strip()
+                if content:
+                    label = role.capitalize() if role else "Unknown"
+                    context_parts.append(f"{label}: {content}")
         context = "\n".join(context_parts)
 
         if not context:
@@ -197,23 +192,29 @@ def load_beam_hf(
             logger.warning("Failed to parse probing_questions for conv %s", conv_id)
             continue
 
-        # probing_qs is a dict: {question_type_label: [{question, answer}, ...]}
+        if not isinstance(probing_qs, dict):
+            logger.warning("Unexpected probing_questions shape for conv %s", conv_id)
+            continue
+
+        # probing_qs is a dict: {question_type_label: [question_dict, ...]}
         for raw_type, qa_list in probing_qs.items():
-            canonical = _alias_map.get(raw_type.lower().strip())
-            if canonical is None or canonical not in question_types:
+            dataset_type = str(raw_type).lower().strip()
+            if dataset_type not in selected_types:
                 continue
             if not isinstance(qa_list, list):
                 continue
 
             for i, qa in enumerate(qa_list):
-                q_text = qa.get("question", "") if isinstance(qa, dict) else ""
-                a_text = qa.get("answer", "") if isinstance(qa, dict) else ""
+                if not isinstance(qa, dict):
+                    continue
+                q_text = str(qa.get("question", "")).strip()
+                a_text = str(qa.get("answer") or qa.get("ideal_response") or "").strip()
                 if not q_text or not a_text:
                     continue
 
                 questions.append(BEAMQuestion(
-                    question_id=f"{conv_id}_{canonical}_{i}",
-                    question_type=canonical,
+                    question_id=f"{conv_id}_{dataset_type}_{i}",
+                    question_type=dataset_type,
                     context=context,
                     question=q_text,
                     gold_answer=a_text,
@@ -244,11 +245,11 @@ def create_synthetic_dataset(n: int = 20) -> list[BEAMQuestion]:
          "The meeting was scheduled for Tuesday at 3pm in conference room B. Bob and Carol attended.",
          "Where was the meeting held?",
          "conference room B"),
-        ("multi_hop",
+        ("multi_session_reasoning",
          "Paris is the capital of France. France is in Western Europe. The Eiffel Tower is in Paris.",
          "In which continent is the Eiffel Tower located?",
          "Western Europe"),
-        ("multi_hop",
+        ("multi_session_reasoning",
          "David is the manager of Emma. Emma is the team lead of Frank. Frank works on the payments service.",
          "Who is the manager of the person leading Frank's team?",
          "David"),
@@ -260,11 +261,11 @@ def create_synthetic_dataset(n: int = 20) -> list[BEAMQuestion]:
          "The price of the subscription was $10/month. In the latest update, it was changed to $15/month.",
          "What is the current subscription price?",
          "$15"),
-        ("temporal",
+        ("temporal_reasoning",
          "The product launched in Q1 2023. The first major update came in Q3 2023. Version 2.0 shipped in Q1 2024.",
          "When did version 2.0 ship?",
          "Q1 2024"),
-        ("temporal",
+        ("temporal_reasoning",
          "Jane started the project in January. She completed the design phase in March. Development finished in June.",
          "What did Jane complete in March?",
          "design phase"),
@@ -333,8 +334,9 @@ def score_answer(predicted: str, gold: str) -> tuple[float, float]:
 async def run_kv_memory_eval(
     questions: list[BEAMQuestion],
     memory,
-    session_id: str = "beam_eval",
+    session_id: Optional[str] = None,
     generation_kwargs: Optional[dict] = None,
+    observer=None,
 ) -> list[BEAMResult]:
     """
     Evaluate KVMemory system on BEAM questions.
@@ -353,15 +355,32 @@ async def run_kv_memory_eval(
 
     if generation_kwargs is None:
         generation_kwargs = {"max_new_tokens": 50, "do_sample": False}
+    session_id = session_id or f"beam_session_{int(time.time())}"
+    eval_observer = observer.child(phase="kv_memory_eval", benchmark="kv_memory") if observer else None
 
     # ----------------------------------------------------------------
     # Phase 1: store all contexts and drain the write queue
     # ----------------------------------------------------------------
     logger.info("Phase 1: storing %d contexts...", len(questions))
+    if eval_observer:
+        eval_observer.emit(
+            "phase_started",
+            phase="store_contexts",
+            benchmark="kv_memory",
+            total_questions=len(questions),
+            session_id=session_id,
+        )
     for q in questions:
         await memory.store(
             text=q.context,
             session_id=session_id,
+            trace_context={
+                "run_id": eval_observer.run_id if eval_observer else None,
+                "phase": "store_contexts",
+                "question_id": q.question_id,
+                "question_type": q.question_type,
+                "benchmark": "kv_memory",
+            },
             explicit_signal=1.0,   # bypass importance filter — context is always relevant
         )
 
@@ -369,6 +388,14 @@ async def run_kv_memory_eval(
     # Without this, generate() would retrieve from an empty collection.
     logger.info("Draining write queue (waiting for Qdrant writes to complete)...")
     await memory._write_queue.shutdown()
+    if eval_observer:
+        eval_observer.emit(
+            "phase_finished",
+            phase="store_contexts",
+            benchmark="kv_memory",
+            total_questions=len(questions),
+            session_id=session_id,
+        )
     # Restart the queue so the memory object remains usable after eval
     from kvmemory.core.queue import WriteQueue
     memory._write_queue = WriteQueue(write_fn=memory._write_fn)
@@ -378,8 +405,32 @@ async def run_kv_memory_eval(
     # ----------------------------------------------------------------
     logger.info("Phase 2: answering %d questions...", len(questions))
     results = []
+    if eval_observer:
+        eval_observer.emit(
+            "phase_started",
+            phase="answer_questions",
+            benchmark="kv_memory",
+            total_questions=len(questions),
+            session_id=session_id,
+        )
 
     for q in questions:
+        question_observer = (
+            eval_observer.child(
+                phase="answer_questions",
+                question_id=q.question_id,
+                question_type=q.question_type,
+                session_id=session_id,
+            )
+            if eval_observer
+            else None
+        )
+        if question_observer:
+            question_observer.emit(
+                "question_started",
+                benchmark="kv_memory",
+                question=q.question,
+            )
         tokens = memory.adapter.tokenizer.encode(q.question)
         session_filter = _build_session_filter(
             model_id=memory.config.model_id,
@@ -400,6 +451,14 @@ async def run_kv_memory_eval(
             session_filter=session_filter,
         )
         t1 = time.perf_counter()
+        if question_observer:
+            question_observer.emit(
+                "retrieval_stage1_done",
+                benchmark="kv_memory",
+                duration_ms=(t1 - t0) * 1000,
+                candidate_count=len(candidate_ids),
+                query_token_count=len(tokens),
+            )
 
         # Stage 2: MMR rerank
         final_ids = stage2_rerank_mmr(
@@ -410,10 +469,27 @@ async def run_kv_memory_eval(
             token_budget=memory.config.token_budget,
         )
         t2 = time.perf_counter()
+        if question_observer:
+            question_observer.emit(
+                "retrieval_stage2_done",
+                benchmark="kv_memory",
+                duration_ms=(t2 - t1) * 1000,
+                selected_count=len(final_ids),
+                selected_ids=final_ids,
+            )
 
         # Fetch KV tensors from blob store
         blocks = memory.kv_store.fetch(final_ids, model_id=memory.config.model_id)
         t3 = time.perf_counter()
+        if question_observer:
+            question_observer.emit(
+                "kv_fetch_done",
+                benchmark="kv_memory",
+                duration_ms=(t3 - t2) * 1000,
+                block_count=len(blocks),
+                block_ids=final_ids,
+                token_count=sum(block.token_count for block in blocks),
+            )
 
         # Inject + generate
         output = inject_and_generate(
@@ -423,8 +499,23 @@ async def run_kv_memory_eval(
             generation_kwargs=generation_kwargs,
         )
         t4 = time.perf_counter()
+        if question_observer:
+            question_observer.emit(
+                "generation_done",
+                benchmark="kv_memory",
+                duration_ms=(t4 - t3) * 1000,
+                output_chars=len(output.text),
+            )
 
         em, f1 = score_answer(output.text, q.gold_answer)
+        if question_observer:
+            question_observer.emit(
+                "score_done",
+                benchmark="kv_memory",
+                em_score=em,
+                f1_score=f1,
+                correct=em > 0 or f1 > 0.5,
+            )
 
         results.append(BEAMResult(
             question_id=q.question_id,
@@ -448,7 +539,22 @@ async def run_kv_memory_eval(
             results[-1].stage1_ms, results[-1].stage2_ms,
             results[-1].fetch_ms, results[-1].generate_ms,
         )
+        if question_observer:
+            question_observer.emit(
+                "question_finished",
+                benchmark="kv_memory",
+                latency_ms=results[-1].latency_ms,
+                prefill_tokens=results[-1].prefill_tokens,
+            )
 
+    if eval_observer:
+        eval_observer.emit(
+            "phase_finished",
+            phase="answer_questions",
+            benchmark="kv_memory",
+            total_questions=len(results),
+            session_id=session_id,
+        )
     return results
 
 
@@ -460,6 +566,7 @@ async def run_rag_baseline(
     questions: list[BEAMQuestion],
     adapter,
     generation_kwargs: Optional[dict] = None,
+    observer=None,
 ) -> list[BEAMResult]:
     """
     RAG baseline: prepend full context as text prefix every turn.
@@ -470,8 +577,24 @@ async def run_rag_baseline(
     if generation_kwargs is None:
         generation_kwargs = {"max_new_tokens": 50, "do_sample": False}
 
+    baseline_observer = observer.child(phase="rag_baseline", benchmark="rag_baseline") if observer else None
+    if baseline_observer:
+        baseline_observer.emit(
+            "phase_started",
+            phase="rag_baseline",
+            benchmark="rag_baseline",
+            total_questions=len(questions),
+        )
+
     results = []
     for q in questions:
+        question_observer = (
+            baseline_observer.child(question_id=q.question_id, question_type=q.question_type)
+            if baseline_observer
+            else None
+        )
+        if question_observer:
+            question_observer.emit("question_started", benchmark="rag_baseline", question=q.question)
         context_tokens = adapter.tokenizer.encode(q.context)
         query_tokens = adapter.tokenizer.encode(q.question)
         combined = context_tokens + query_tokens
@@ -479,8 +602,23 @@ async def run_rag_baseline(
         t0 = time.perf_counter()
         output = adapter.inject_and_generate([], combined, generation_kwargs)
         latency_ms = (time.perf_counter() - t0) * 1000
+        if question_observer:
+            question_observer.emit(
+                "generation_done",
+                benchmark="rag_baseline",
+                duration_ms=latency_ms,
+                output_chars=len(output.text),
+            )
 
         em, f1 = score_answer(output.text, q.gold_answer)
+        if question_observer:
+            question_observer.emit(
+                "score_done",
+                benchmark="rag_baseline",
+                em_score=em,
+                f1_score=f1,
+                correct=em > 0 or f1 > 0.5,
+            )
 
         results.append(BEAMResult(
             question_id=q.question_id,
@@ -493,7 +631,21 @@ async def run_rag_baseline(
             prefill_tokens=len(combined),   # RAG pays full context every turn
             latency_ms=latency_ms,
         ))
+        if question_observer:
+            question_observer.emit(
+                "question_finished",
+                benchmark="rag_baseline",
+                latency_ms=latency_ms,
+                prefill_tokens=len(combined),
+            )
 
+    if baseline_observer:
+        baseline_observer.emit(
+            "phase_finished",
+            phase="rag_baseline",
+            benchmark="rag_baseline",
+            total_questions=len(results),
+        )
     return results
 
 
@@ -506,6 +658,7 @@ async def run_sliding_window_baseline(
     adapter,
     window_tokens: int = 2000,
     generation_kwargs: Optional[dict] = None,
+    observer=None,
 ) -> list[BEAMResult]:
     """
     Sliding window baseline: keep the last N tokens of context.
@@ -515,8 +668,32 @@ async def run_sliding_window_baseline(
     if generation_kwargs is None:
         generation_kwargs = {"max_new_tokens": 50, "do_sample": False}
 
+    baseline_observer = observer.child(
+        phase="sliding_window_baseline",
+        benchmark="sliding_window_baseline",
+    ) if observer else None
+    if baseline_observer:
+        baseline_observer.emit(
+            "phase_started",
+            phase="sliding_window_baseline",
+            benchmark="sliding_window_baseline",
+            total_questions=len(questions),
+            window_tokens=window_tokens,
+        )
+
     results = []
     for q in questions:
+        question_observer = (
+            baseline_observer.child(question_id=q.question_id, question_type=q.question_type)
+            if baseline_observer
+            else None
+        )
+        if question_observer:
+            question_observer.emit(
+                "question_started",
+                benchmark="sliding_window_baseline",
+                question=q.question,
+            )
         context_tokens = adapter.tokenizer.encode(q.context)
         query_tokens = adapter.tokenizer.encode(q.question)
 
@@ -532,8 +709,23 @@ async def run_sliding_window_baseline(
         t0 = time.perf_counter()
         output = adapter.inject_and_generate([], combined, generation_kwargs)
         latency_ms = (time.perf_counter() - t0) * 1000
+        if question_observer:
+            question_observer.emit(
+                "generation_done",
+                benchmark="sliding_window_baseline",
+                duration_ms=latency_ms,
+                output_chars=len(output.text),
+            )
 
         em, f1 = score_answer(output.text, q.gold_answer)
+        if question_observer:
+            question_observer.emit(
+                "score_done",
+                benchmark="sliding_window_baseline",
+                em_score=em,
+                f1_score=f1,
+                correct=em > 0 or f1 > 0.5,
+            )
 
         results.append(BEAMResult(
             question_id=q.question_id,
@@ -546,7 +738,22 @@ async def run_sliding_window_baseline(
             prefill_tokens=len(combined),
             latency_ms=latency_ms,
         ))
+        if question_observer:
+            question_observer.emit(
+                "question_finished",
+                benchmark="sliding_window_baseline",
+                latency_ms=latency_ms,
+                prefill_tokens=len(combined),
+            )
 
+    if baseline_observer:
+        baseline_observer.emit(
+            "phase_finished",
+            phase="sliding_window_baseline",
+            benchmark="sliding_window_baseline",
+            total_questions=len(results),
+            window_tokens=window_tokens,
+        )
     return results
 
 
@@ -668,85 +875,163 @@ async def main(args) -> None:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-
-    # Load questions
-    if args.synthetic:
-        questions = create_synthetic_dataset(n=args.n)
-        logger.info("Using %d synthetic questions", len(questions))
-    elif args.hf:
-        questions = load_beam_hf(
-            scale=args.scale,
-            question_types=QUESTION_TYPES,
-            max_questions=args.n,
-        )
-    else:
-        questions = load_beam_jsonl(args.dataset)
-        if args.n:
-            questions = questions[:args.n]
-
-    if not questions:
-        logger.error("No questions loaded. Exiting.")
-        return
-
-    # Load model
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    from kvmemory import KVMemory, KVMemoryConfig
+    from kvmemory import KVMemory, KVMemoryConfig, ObservabilityStore
     from kvmemory.adapters.hf_adapter import HFAdapter
-
+    from transformers import AutoModelForCausalLM, AutoTokenizer
     import torch
-    dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
-    torch_dtype = dtype_map.get(args.dtype, torch.float16)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    logger.info("Loading model %s (dtype=%s, device=%s)...", args.model, args.dtype, device)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        dtype=torch_dtype,
-        device_map=device,
-    )
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    adapter = HFAdapter(model, tokenizer)
-
-    config = KVMemoryConfig(
-        model_id=args.model.replace("/", "_"),
-        retrieval_layers=args.retrieval_layers,
-        token_budget=args.token_budget,
-        importance_threshold=0.0 if args.synthetic else 0.3,
-    )
-    memory = KVMemory(adapter=adapter, config=config)
-
-    gen_kwargs = {"max_new_tokens": args.max_new_tokens, "do_sample": False}
-
-    # Run KV Memory eval
-    logger.info("Running KV Memory evaluation (%d questions)...", len(questions))
-    kv_results = await run_kv_memory_eval(questions, memory, generation_kwargs=gen_kwargs)
-
-    # Run RAG baseline
-    logger.info("Running RAG baseline...")
-    rag_results = await run_rag_baseline(questions, adapter, generation_kwargs=gen_kwargs)
-
-    # Run sliding window baseline
-    logger.info("Running sliding window baseline (window=%d tokens)...", args.token_budget)
-    sw_results = await run_sliding_window_baseline(
-        questions, adapter,
-        window_tokens=args.token_budget,
-        generation_kwargs=gen_kwargs,
+    dataset_source = "synthetic" if args.synthetic else ("huggingface" if args.hf else "jsonl")
+    obs_store = ObservabilityStore(args.obs_dir)
+    run_observer = obs_store.create_run(
+        config={
+            "model": args.model,
+            "dtype": args.dtype,
+            "dataset": args.dataset,
+            "hf": args.hf,
+            "synthetic": args.synthetic,
+            "scale": args.scale,
+            "n": args.n,
+            "retrieval_layers": args.retrieval_layers,
+            "token_budget": args.token_budget,
+            "max_new_tokens": args.max_new_tokens,
+        },
+        metadata={"dataset_source": dataset_source, "run_kind": "beam_benchmark"},
     )
 
-    kv_metrics = compute_metrics(kv_results)
-    rag_metrics = compute_metrics(rag_results)
-    sw_metrics = compute_metrics(sw_results)
+    memory = None
+    try:
+        run_observer.emit("run_started", dataset_source=dataset_source)
+        run_observer.emit("phase_started", phase="dataset_load", dataset_source=dataset_source)
 
-    print_comparison(kv_metrics, rag_metrics, sw_metrics)
+        if args.synthetic:
+            questions = create_synthetic_dataset(n=args.n or 20)
+            logger.info("Using %d synthetic questions", len(questions))
+        elif args.hf:
+            questions = load_beam_hf(
+                scale=args.scale,
+                question_types=QUESTION_TYPES,
+                max_questions=args.n,
+            )
+        else:
+            questions = load_beam_jsonl(args.dataset)
+            if args.n:
+                questions = questions[:args.n]
 
-    if args.output:
-        _save_results(args.output, kv_results, rag_results, sw_results,
-                      kv_metrics, rag_metrics, sw_metrics)
-        logger.info("Results saved to %s", args.output)
+        if not questions:
+            logger.error("No questions loaded. Exiting.")
+            run_observer.fail(error="No questions loaded")
+            return
 
-    await memory.close()
+        run_observer.update_metadata(
+            question_count=len(questions),
+            question_types=sorted({question.question_type for question in questions}),
+        )
+        run_observer.emit(
+            "phase_finished",
+            phase="dataset_load",
+            dataset_source=dataset_source,
+            question_count=len(questions),
+        )
+
+        dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
+        torch_dtype = dtype_map.get(args.dtype, torch.float16)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        run_observer.emit(
+            "phase_started",
+            phase="model_load",
+            model=args.model,
+            dtype=args.dtype,
+            device=device,
+        )
+        model_kwargs = {"torch_dtype": torch_dtype}
+        if device == "cuda":
+            model_kwargs["device_map"] = "auto"
+        model = AutoModelForCausalLM.from_pretrained(args.model, **model_kwargs)
+        if device != "cuda":
+            model.to(device)
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        adapter = HFAdapter(model, tokenizer)
+        run_observer.emit(
+            "phase_finished",
+            phase="model_load",
+            model=args.model,
+            dtype=args.dtype,
+            device=device,
+        )
+
+        config = KVMemoryConfig(
+            model_id=args.model.replace("/", "_"),
+            retrieval_layers=args.retrieval_layers,
+            token_budget=args.token_budget,
+            importance_threshold=0.0 if args.synthetic else 0.3,
+        )
+        memory = KVMemory(adapter=adapter, config=config, observer=run_observer)
+        gen_kwargs = {"max_new_tokens": args.max_new_tokens, "do_sample": False}
+        benchmark_session_id = f"beam_{run_observer.run_id}"
+        run_observer.update_metadata(session_id=benchmark_session_id)
+
+        logger.info("Running KV Memory evaluation (%d questions)...", len(questions))
+        kv_results = await run_kv_memory_eval(
+            questions,
+            memory,
+            session_id=benchmark_session_id,
+            generation_kwargs=gen_kwargs,
+            observer=run_observer,
+        )
+
+        logger.info("Running RAG baseline...")
+        rag_results = await run_rag_baseline(
+            questions,
+            adapter,
+            generation_kwargs=gen_kwargs,
+            observer=run_observer,
+        )
+
+        logger.info("Running sliding window baseline (window=%d tokens)...", args.token_budget)
+        sw_results = await run_sliding_window_baseline(
+            questions,
+            adapter,
+            window_tokens=args.token_budget,
+            generation_kwargs=gen_kwargs,
+            observer=run_observer,
+        )
+
+        kv_metrics = compute_metrics(kv_results)
+        rag_metrics = compute_metrics(rag_results)
+        sw_metrics = compute_metrics(sw_results)
+        print_comparison(kv_metrics, rag_metrics, sw_metrics)
+
+        summary = {
+            "question_count": len(questions),
+            "kv_metrics": dataclasses.asdict(kv_metrics),
+            "rag_metrics": dataclasses.asdict(rag_metrics),
+            "sliding_window_metrics": dataclasses.asdict(sw_metrics),
+        }
+        run_observer.update_summary(**summary)
+
+        if args.output:
+            _save_results(args.output, kv_results, rag_results, sw_results, kv_metrics, rag_metrics, sw_metrics)
+            logger.info("Results saved to %s", args.output)
+            run_observer.emit("results_saved", output_path=args.output)
+
+        run_observer.finish(summary=summary)
+    except Exception as exc:
+        run_observer.emit(
+            "error",
+            level="error",
+            phase="benchmark_run",
+            message="Benchmark run failed",
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
+        run_observer.fail(error=str(exc), error_type=type(exc).__name__)
+        raise
+    finally:
+        if memory is not None:
+            await memory.close()
 
 
 def _save_results(path, kv_results, rag_results, sw_results,
@@ -807,6 +1092,8 @@ if __name__ == "__main__":
 
     # Output
     parser.add_argument("--output", help="Path to save JSON results")
+    parser.add_argument("--obs-dir", default=".kvmem_obs",
+                        help="Directory for durable run/event tracking")
     parser.add_argument("--verbose", "-v", action="store_true")
 
     args = parser.parse_args()

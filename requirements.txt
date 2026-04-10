@@ -15,6 +15,10 @@ asyncio; python_version < "3.10"
 pytest>=7.0
 pytest-asyncio>=0.21
 
+# Local dashboard API
+fastapi>=0.115
+uvicorn>=0.30
+
 # Optional: Phase 2 adapters
 # llama-cpp-python    # llamacpp adapter
 # vllm                # vLLM adapter (Linux only)

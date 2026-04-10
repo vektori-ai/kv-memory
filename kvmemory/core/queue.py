@@ -12,11 +12,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
     from ..adapters.base import BaseAdapter
     from ..config import KVMemoryConfig
+    from ..observability import RunObserver
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,8 @@ class WriteQueue:
         agent_id: Optional[str] = None,
         shared: bool = False,
         explicit_signal: float = 0.0,
+        observer: Optional["RunObserver"] = None,
+        trace_context: Optional[dict[str, Any]] = None,
     ) -> None:
         """
         Enqueue a write task. Returns immediately — never blocks.
@@ -83,7 +86,20 @@ class WriteQueue:
         """
         if not self._running:
             self.start()
-        await self._queue.put((session_id, tokens, text, adapter, config, agent_id, shared, explicit_signal))
+        await self._queue.put(
+            (
+                session_id,
+                tokens,
+                text,
+                adapter,
+                config,
+                agent_id,
+                shared,
+                explicit_signal,
+                observer,
+                trace_context,
+            )
+        )
         logger.debug("WriteQueue.enqueue: session=%s, tokens=%d", session_id, len(tokens))
 
     async def shutdown(self, timeout: float = 10.0) -> None:
@@ -129,9 +145,31 @@ class WriteQueue:
             except asyncio.CancelledError:
                 break
 
-            session_id, tokens, text, adapter, config, agent_id, shared, explicit_signal = item
+            (
+                session_id,
+                tokens,
+                text,
+                adapter,
+                config,
+                agent_id,
+                shared,
+                explicit_signal,
+                observer,
+                trace_context,
+            ) = item
             try:
-                await self._write_fn(session_id, tokens, text, adapter, config, agent_id, shared, explicit_signal)
+                await self._write_fn(
+                    session_id,
+                    tokens,
+                    text,
+                    adapter,
+                    config,
+                    agent_id,
+                    shared,
+                    explicit_signal,
+                    observer,
+                    trace_context,
+                )
             except Exception as e:
                 logger.error(
                     "WriteQueue._process: write failed for session=%s: %s",

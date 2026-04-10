@@ -37,6 +37,10 @@ dist/
 # Project-specific generated storage
 kv_store/
 test_kv_store/
+.kvmem_obs/
+.test_obs_tmp/
+.hf/
+tmp*/
 
 # Downloaded models
 models/
@@ -49,3 +53,4 @@ results/
 
 # Markdown files
 *.md
+.env

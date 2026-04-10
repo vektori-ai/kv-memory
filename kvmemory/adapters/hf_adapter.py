@@ -5,12 +5,14 @@ Phase 1 adapter. Uses:
   - output_hidden_states=True for capture()
   - past_key_values for inject_and_generate()
 
-KV layout from HF:
-  past_key_values[layer] = (K, V)
-  K / V shape: [batch, heads, seq, head_dim]
+KV layout from HF (transformers 5.x):
+  past_key_values.layers[i].keys  → K: [batch, kv_heads, seq, head_dim]
+  past_key_values.layers[i].values → V: [batch, kv_heads, seq, head_dim]
+
+  For GQA models (e.g. Qwen2.5-7B): kv_heads < num_attention_heads.
 
 We store with batch dim squeezed:
-  K / V shape: [heads, seq, head_dim]
+  K / V shape: [kv_heads, seq, head_dim]
 """
 
 from __future__ import annotations
@@ -44,6 +46,10 @@ class HFAdapter(BaseAdapter):
         self._num_layers: int = model.config.num_hidden_layers
         self._d_model: int = model.config.hidden_size
         self._num_heads: int = model.config.num_attention_heads
+        # GQA: KV heads may differ from Q heads (e.g. Qwen2.5-7B has 28 Q heads, 4 KV heads)
+        self._num_kv_heads: int = getattr(
+            model.config, "num_key_value_heads", model.config.num_attention_heads
+        )
 
     # ------------------------------------------------------------------
     # BaseAdapter properties
@@ -101,26 +107,42 @@ class HFAdapter(BaseAdapter):
                 use_cache=True,
             )
 
-        # past_key_values: DynamicCache (transformers >= 4.38) or legacy tuple of (K, V) per layer.
-        # K/V shape from HF: [batch=1, heads, seq, head_dim]
+        # Normalize past_key_values to a list of (K, V) tuples — one per layer.
+        # K/V shape from HF: [batch=1, kv_heads, seq, head_dim]
+        #
+        # transformers 5.x:  DynamicCache with .layers list; each DynamicLayer has .keys/.values
+        # transformers 4.38+: DynamicCache with .to_legacy_cache() or .key_cache/.value_cache
+        # transformers <4.38: legacy tuple of (K, V) per layer (directly subscriptable)
         pkv = out.past_key_values
-        # Normalize to legacy tuple format so the rest of the code stays simple.
-        if hasattr(pkv, "to_legacy_cache"):
-            pkv = pkv.to_legacy_cache()
+        if hasattr(pkv, "layers") and pkv.layers:
+            # transformers 5.x
+            pkv_list: list[tuple[torch.Tensor, torch.Tensor]] = [
+                (layer.keys, layer.values)
+                for layer in pkv.layers
+                if getattr(layer, "is_initialized", True) and hasattr(layer, "keys")
+            ]
+            logger.debug("capture: transformers 5.x DynamicCache, %d layers", len(pkv_list))
+        elif hasattr(pkv, "to_legacy_cache"):
+            # transformers 4.38–4.x
+            pkv_list = list(pkv.to_legacy_cache())
+            logger.debug("capture: transformers 4.x DynamicCache (to_legacy_cache), %d layers", len(pkv_list))
         elif hasattr(pkv, "key_cache"):
-            pkv = tuple((k, v) for k, v in zip(pkv.key_cache, pkv.value_cache))
+            pkv_list = list(zip(pkv.key_cache, pkv.value_cache))
+            logger.debug("capture: transformers 4.x DynamicCache (key_cache), %d layers", len(pkv_list))
+        else:
+            pkv_list = list(pkv)
+            logger.debug("capture: legacy tuple cache, %d layers", len(pkv_list))
 
         kv_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         for layer_idx in layers:
-            if layer_idx >= len(pkv):
+            if layer_idx >= len(pkv_list):
                 logger.warning(
-                    "Layer %d out of range (model has %d layers), skipping",
-                    layer_idx,
-                    len(pkv),
+                    "Layer %d out of range (cache has %d layers), skipping",
+                    layer_idx, len(pkv_list),
                 )
                 continue
-            K = pkv[layer_idx][0].squeeze(0)  # [heads, seq, head_dim]
-            V = pkv[layer_idx][1].squeeze(0)
+            K = pkv_list[layer_idx][0].squeeze(0)  # [kv_heads, seq, head_dim]
+            V = pkv_list[layer_idx][1].squeeze(0)
             kv_by_layer[layer_idx] = (K, V)
 
         # hidden_states: tuple of tensors [batch, seq, d_model], one per layer + embedding
@@ -170,8 +192,13 @@ class HFAdapter(BaseAdapter):
 
         if not blocks:
             # No injection — use generate() directly, no API issues
+            attention_mask = torch.ones_like(input_ids, dtype=torch.long)
             with torch.no_grad():
-                out = self.model.generate(input_ids=input_ids, **dict(generation_kwargs))
+                out = self.model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    **dict(generation_kwargs),
+                )
             sequences = out.tolist()
             text = self._tokenizer.decode(sequences[0], skip_special_tokens=True)
             return GenerationOutput(sequences=sequences, text=text)
@@ -209,19 +236,21 @@ class HFAdapter(BaseAdapter):
         Builds a DynamicCache (transformers >= 4.38) when available.
         Falls back to legacy tuple-of-tuples for older versions.
 
-        Every layer gets an entry: real KV for stored layers, empty tensors
-        for unstored layers. This ensures consistent cache_position accounting
-        across all layers regardless of which layers have stored KV.
+        Every layer gets an entry: real KV for stored layers, 0-length placeholder
+        tensors for unstored layers. All tensors are cast to the model's native dtype
+        so SDPA never sees a dtype mismatch between query and injected KV.
 
         Returns:
             (past_key_values, total_past_tokens)
             total_past_tokens: sum of token counts across all injected blocks,
-                               used to set cache_position for the query.
+                               used to set position_ids and the attention mask offset.
         """
         head_dim = self._d_model // self._num_heads
+        kv_dtype = self.model.dtype  # match model's compute dtype (fp16, bf16, fp32)
         total_past_tokens = sum(b.token_count for b in blocks)
 
-        # Build per-layer (K_cat, V_cat) — empty tensors for unstored layers
+        # Build per-layer (K_cat, V_cat) — 0-length placeholders for unstored layers.
+        # Use _num_kv_heads (not _num_heads) — GQA models have fewer KV heads than Q heads.
         layer_kvs: list[tuple[torch.Tensor, torch.Tensor]] = []
         for layer_idx in range(self._num_layers):
             K_parts: list[torch.Tensor] = []
@@ -234,32 +263,52 @@ class HFAdapter(BaseAdapter):
                 k_scale, v_scale = block.quant_scales[layer_idx]
                 K = torch.from_numpy(K_q.astype(np.float32)) * k_scale
                 V = torch.from_numpy(V_q.astype(np.float32)) * v_scale
-                K = K.to(dtype=torch.float16, device=self.model.device)
-                V = V.to(dtype=torch.float16, device=self.model.device)
-                K_parts.append(K)  # [heads, seq_i, head_dim]
+                K = K.to(dtype=kv_dtype, device=self.model.device)
+                V = V.to(dtype=kv_dtype, device=self.model.device)
+                K_parts.append(K)  # [kv_heads, seq_i, head_dim]
                 V_parts.append(V)
 
             if K_parts:
-                K_cat = torch.cat(K_parts, dim=1).unsqueeze(0)  # [1, heads, total_seq, head_dim]
+                K_cat = torch.cat(K_parts, dim=1).unsqueeze(0)  # [1, kv_heads, total_seq, head_dim]
                 V_cat = torch.cat(V_parts, dim=1).unsqueeze(0)
             else:
-                # Empty placeholder: 0-length seq so the layer has no prior context
-                K_cat = torch.zeros(1, self._num_heads, 0, head_dim,
-                                    dtype=torch.float16, device=self.model.device)
-                V_cat = torch.zeros(1, self._num_heads, 0, head_dim,
-                                    dtype=torch.float16, device=self.model.device)
+                # 0-length placeholder: this layer has no prior context.
+                K_cat = torch.zeros(1, self._num_kv_heads, 0, head_dim,
+                                    dtype=kv_dtype, device=self.model.device)
+                V_cat = torch.zeros(1, self._num_kv_heads, 0, head_dim,
+                                    dtype=kv_dtype, device=self.model.device)
 
             layer_kvs.append((K_cat, V_cat))
 
-        # Always use the legacy tuple format for the manual decode loop.
-        # model() forward accepts both legacy tuples and DynamicCache equally,
-        # and the manual loop doesn't have the generate() API incompatibilities.
-        return tuple(layer_kvs), total_past_tokens
+        # Build a DynamicCache — newer transformers (4.38+) requires an object with
+        # get_seq_length(). We subclass it so that get_seq_length() always returns
+        # total_past_tokens: masking_utils uses this as q_offset for the causal mask,
+        # and it must match the position_ids we pass (which also start at total_past_tokens).
+        # Without this, layers with 0-length placeholders would return 0 from get_seq_length(),
+        # causing the causal mask to be built with the wrong offset.
+        try:
+            from transformers import DynamicCache
+
+            class _InjectedCache(DynamicCache):
+                """DynamicCache with a fixed get_seq_length() for correct causal masking."""
+                _total_past: int
+
+                def get_seq_length(self, layer_idx: int = 0) -> int:  # type: ignore[override]
+                    return self._total_past
+
+            cache = _InjectedCache()
+            cache._total_past = total_past_tokens
+            for layer_idx, (K_cat, V_cat) in enumerate(layer_kvs):
+                cache.update(K_cat, V_cat, layer_idx)
+            return cache, total_past_tokens
+        except ImportError:
+            # Fallback for very old transformers
+            return tuple(layer_kvs), total_past_tokens
 
     def _manual_generate(
         self,
         input_ids: torch.Tensor,
-        past_kv: tuple,
+        past_kv,
         position_offset: int,
         generation_kwargs: dict,
     ) -> "GenerationOutput":
@@ -281,16 +330,23 @@ class HFAdapter(BaseAdapter):
         seq_len = input_ids.shape[1]
         generated: list[int] = input_ids[0].tolist()
 
-        # Prefill: process all query tokens with injected KV context
+        # Prefill: process all query tokens with injected KV context.
+        # attention_mask must cover the full sequence (injected past + current query)
+        # so the model knows which positions are valid. Without it, newer transformers
+        # infers a mask sized only to input_ids, ignoring the injected past tokens.
         pos_ids = torch.arange(
             position_offset, position_offset + seq_len, device=self.model.device
         ).unsqueeze(0)  # [1, seq]
+        attn_mask = torch.ones(
+            1, position_offset + seq_len, device=self.model.device, dtype=torch.long
+        )
 
         with torch.no_grad():
             fwd = self.model(
                 input_ids=input_ids,
                 past_key_values=past_kv,
                 position_ids=pos_ids,
+                attention_mask=attn_mask,
                 use_cache=True,
             )
 
@@ -316,11 +372,14 @@ class HFAdapter(BaseAdapter):
 
             step_ids = torch.tensor([[next_token]], device=self.model.device)
             step_pos = torch.tensor([[next_pos]], device=self.model.device)
+            # Grow the mask by 1 each step to include the new token
+            step_mask = torch.ones(1, next_pos + 1, device=self.model.device, dtype=torch.long)
             with torch.no_grad():
                 fwd = self.model(
                     input_ids=step_ids,
                     past_key_values=current_pkv,
                     position_ids=step_pos,
+                    attention_mask=step_mask,
                     use_cache=True,
                 )
             current_pkv = fwd.past_key_values

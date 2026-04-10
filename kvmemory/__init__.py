@@ -16,11 +16,14 @@ Quick start:
 
 from .config import KVMemoryConfig
 from .memory import KVMemory
+from .observability import ObservabilityStore, RunObserver
 from .storage.schema import GenerationOutput, KVBlock
 
 __all__ = [
     "KVMemory",
     "KVMemoryConfig",
+    "ObservabilityStore",
+    "RunObserver",
     "KVBlock",
     "GenerationOutput",
 ]
