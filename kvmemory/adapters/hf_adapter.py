@@ -101,19 +101,26 @@ class HFAdapter(BaseAdapter):
                 use_cache=True,
             )
 
-        # past_key_values: tuple of (K, V) per layer
+        # past_key_values: DynamicCache (transformers >= 4.38) or legacy tuple of (K, V) per layer.
         # K/V shape from HF: [batch=1, heads, seq, head_dim]
+        pkv = out.past_key_values
+        # Normalize to legacy tuple format so the rest of the code stays simple.
+        if hasattr(pkv, "to_legacy_cache"):
+            pkv = pkv.to_legacy_cache()
+        elif hasattr(pkv, "key_cache"):
+            pkv = tuple((k, v) for k, v in zip(pkv.key_cache, pkv.value_cache))
+
         kv_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         for layer_idx in layers:
-            if layer_idx >= len(out.past_key_values):
+            if layer_idx >= len(pkv):
                 logger.warning(
                     "Layer %d out of range (model has %d layers), skipping",
                     layer_idx,
-                    len(out.past_key_values),
+                    len(pkv),
                 )
                 continue
-            K = out.past_key_values[layer_idx][0].squeeze(0)  # [heads, seq, head_dim]
-            V = out.past_key_values[layer_idx][1].squeeze(0)
+            K = pkv[layer_idx][0].squeeze(0)  # [heads, seq, head_dim]
+            V = pkv[layer_idx][1].squeeze(0)
             kv_by_layer[layer_idx] = (K, V)
 
         # hidden_states: tuple of tensors [batch, seq, d_model], one per layer + embedding

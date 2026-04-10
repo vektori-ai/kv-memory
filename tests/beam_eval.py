@@ -693,8 +693,17 @@ async def main(args) -> None:
     from kvmemory import KVMemory, KVMemoryConfig
     from kvmemory.adapters.hf_adapter import HFAdapter
 
-    logger.info("Loading model %s...", args.model)
-    model = AutoModelForCausalLM.from_pretrained(args.model)
+    import torch
+    dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
+    torch_dtype = dtype_map.get(args.dtype, torch.float16)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    logger.info("Loading model %s (dtype=%s, device=%s)...", args.model, args.dtype, device)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model,
+        dtype=torch_dtype,
+        device_map=device,
+    )
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -792,6 +801,9 @@ if __name__ == "__main__":
     parser.add_argument("--token-budget", type=int, default=2000,
                         help="Hard cap on injected tokens (default: 2000)")
     parser.add_argument("--max-new-tokens", type=int, default=50)
+    parser.add_argument("--dtype", default="float16",
+                        choices=["float16", "bfloat16", "float32"],
+                        help="Model weight dtype (default: float16)")
 
     # Output
     parser.add_argument("--output", help="Path to save JSON results")

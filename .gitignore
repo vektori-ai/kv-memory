@@ -38,6 +38,12 @@ dist/
 kv_store/
 test_kv_store/
 
+# Downloaded models
+models/
+
+# Benchmark results
+results/
+
 # Notebook checkpoints
 .ipynb_checkpoints/
 
