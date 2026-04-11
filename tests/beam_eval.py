@@ -330,6 +330,39 @@ def score_answer(predicted: str, gold: str) -> tuple[float, float]:
 
 
 # ------------------------------------------------------------------
+# Tokenizer helpers
+# ------------------------------------------------------------------
+
+def _apply_chat_template(tokenizer, messages: list[dict]) -> list[int]:
+    """Apply chat template and guarantee a list[int] regardless of tokenizer version.
+
+    Handles: plain list[int], str, BatchEncoding/Mapping, tensor, nested list.
+    """
+    from collections.abc import Mapping
+
+    result = tokenizer.apply_chat_template(
+        messages, tokenize=True, add_generation_prompt=True,
+    )
+
+    if isinstance(result, str):
+        try:
+            return tokenizer.encode(result, add_special_tokens=False)
+        except TypeError:
+            return tokenizer.encode(result)
+
+    if isinstance(result, Mapping):
+        result = result["input_ids"]
+
+    if hasattr(result, "tolist"):
+        result = result.tolist()
+
+    if result and isinstance(result[0], list):
+        result = result[0]
+
+    return [int(x) for x in result]
+
+
+# ------------------------------------------------------------------
 # KV Memory evaluation — instrumented, race-condition-free
 # ------------------------------------------------------------------
 
@@ -477,9 +510,9 @@ async def run_kv_memory_eval(
 
         # For generation — full chat-formatted prompt
         if hasattr(memory.adapter.tokenizer, "apply_chat_template"):
-            generation_tokens = memory.adapter.tokenizer.apply_chat_template(
+            generation_tokens = _apply_chat_template(
+                memory.adapter.tokenizer,
                 [{"role": "user", "content": q.question}],
-                tokenize=True, add_generation_prompt=True,
             )
         else:
             generation_tokens = memory.adapter.tokenizer.encode(q.question)  # fallback
@@ -728,9 +761,9 @@ async def run_rag_baseline(
         user_msg = f"Context:\n{retrieved_text}\n\nQuestion:\n{q.question}\nAnswer concisely."
 
         if hasattr(adapter.tokenizer, "apply_chat_template"):
-            combined_tokens = adapter.tokenizer.apply_chat_template(
+            combined_tokens = _apply_chat_template(
+                adapter.tokenizer,
                 [{"role": "user", "content": user_msg}],
-                tokenize=True, add_generation_prompt=True,
             )
         else:
             combined_tokens = adapter.tokenizer.encode(user_msg)
@@ -743,9 +776,9 @@ async def run_rag_baseline(
                 candidate_text = adapter.tokenizer.decode(retrieved_token_ids[:mid], skip_special_tokens=True)
                 candidate_msg = f"Context:\n{candidate_text}\n\nQuestion:\n{q.question}\nAnswer concisely."
                 if hasattr(adapter.tokenizer, "apply_chat_template"):
-                    candidate_toks = adapter.tokenizer.apply_chat_template(
+                    candidate_toks = _apply_chat_template(
+                        adapter.tokenizer,
                         [{"role": "user", "content": candidate_msg}],
-                        tokenize=True, add_generation_prompt=True,
                     )
                 else:
                     candidate_toks = adapter.tokenizer.encode(candidate_msg)
@@ -760,9 +793,9 @@ async def run_rag_baseline(
                 retrieved_text = adapter.tokenizer.decode(retrieved_token_ids[:lo], skip_special_tokens=True)
             user_msg = f"Context:\n{retrieved_text}\n\nQuestion:\n{q.question}\nAnswer concisely."
             if hasattr(adapter.tokenizer, "apply_chat_template"):
-                combined_tokens = adapter.tokenizer.apply_chat_template(
+                combined_tokens = _apply_chat_template(
+                    adapter.tokenizer,
                     [{"role": "user", "content": user_msg}],
-                    tokenize=True, add_generation_prompt=True,
                 )
             else:
                 combined_tokens = adapter.tokenizer.encode(user_msg)
@@ -880,9 +913,9 @@ async def run_sliding_window_baseline(
 
         sw_user_msg = f"Context:\n{window_text}\n\nQuestion:\n{q.question}\nAnswer concisely."
         if hasattr(adapter.tokenizer, "apply_chat_template"):
-            combined_tokens = adapter.tokenizer.apply_chat_template(
+            combined_tokens = _apply_chat_template(
+                adapter.tokenizer,
                 [{"role": "user", "content": sw_user_msg}],
-                tokenize=True, add_generation_prompt=True,
             )
         else:
             combined_tokens = adapter.tokenizer.encode(sw_user_msg)
@@ -895,9 +928,9 @@ async def run_sliding_window_baseline(
                 candidate_text = adapter.tokenizer.decode(context_token_ids[-mid:], skip_special_tokens=True)
                 candidate_msg = f"Context:\n{candidate_text}\n\nQuestion:\n{q.question}\nAnswer concisely."
                 if hasattr(adapter.tokenizer, "apply_chat_template"):
-                    candidate_toks = adapter.tokenizer.apply_chat_template(
+                    candidate_toks = _apply_chat_template(
+                        adapter.tokenizer,
                         [{"role": "user", "content": candidate_msg}],
-                        tokenize=True, add_generation_prompt=True,
                     )
                 else:
                     candidate_toks = adapter.tokenizer.encode(candidate_msg)
@@ -912,9 +945,9 @@ async def run_sliding_window_baseline(
                 window_text = adapter.tokenizer.decode(context_token_ids[-lo:], skip_special_tokens=True)
             sw_user_msg = f"Context:\n{window_text}\n\nQuestion:\n{q.question}\nAnswer concisely."
             if hasattr(adapter.tokenizer, "apply_chat_template"):
-                combined_tokens = adapter.tokenizer.apply_chat_template(
+                combined_tokens = _apply_chat_template(
+                    adapter.tokenizer,
                     [{"role": "user", "content": sw_user_msg}],
-                    tokenize=True, add_generation_prompt=True,
                 )
             else:
                 combined_tokens = adapter.tokenizer.encode(sw_user_msg)

@@ -279,6 +279,43 @@ class TestKVStoreWriteRead:
 
 
 # ------------------------------------------------------------------
+# _apply_chat_template helper
+# ------------------------------------------------------------------
+
+class TestApplyChatTemplate:
+    """Verify _apply_chat_template always returns list[int] for any tokenizer return type."""
+
+    def _helper(self, return_value):
+        from unittest.mock import MagicMock
+        from tests.beam_eval import _apply_chat_template
+        tok = MagicMock()
+        tok.apply_chat_template.return_value = return_value
+        tok.encode.return_value = [10, 20, 30]
+        return _apply_chat_template(tok, [{"role": "user", "content": "hi"}])
+
+    def test_plain_list(self):
+        result = self._helper([1, 2, 3])
+        assert result == [1, 2, 3]
+
+    def test_string_fallback(self):
+        result = self._helper("hello world")
+        assert isinstance(result, list)
+        assert all(isinstance(x, int) for x in result)
+
+    def test_batch_encoding_mapping(self):
+        result = self._helper({"input_ids": [4, 5, 6], "attention_mask": [1, 1, 1]})
+        assert result == [4, 5, 6]
+
+    def test_nested_list(self):
+        result = self._helper([[7, 8, 9]])
+        assert result == [7, 8, 9]
+
+    def test_all_int(self):
+        result = self._helper([100, 200, 300])
+        assert all(isinstance(x, int) for x in result)
+
+
+# ------------------------------------------------------------------
 # Capture parity: capture() vs capture_batch()[0]
 # ------------------------------------------------------------------
 
