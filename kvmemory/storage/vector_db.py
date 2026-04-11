@@ -18,6 +18,8 @@ from typing import Optional
 
 import numpy as np
 from qdrant_client import QdrantClient
+
+from ..utils.model_id import sanitize_model_id
 from qdrant_client.models import (
     Distance,
     FieldCondition,
@@ -266,6 +268,85 @@ class VectorDB:
         ).points
         return str(results[0].id) if results else None
 
+    def find_duplicate_multilayer(
+        self,
+        model_id: str,
+        hidden_vecs: dict[int, np.ndarray],
+        layer_weights: dict[int, float],
+        threshold: float = 0.95,
+        session_id: Optional[str] = None,
+        top_k_per_layer: int = 20,
+    ) -> Optional[str]:
+        """
+        Multi-layer semantic dedup using candidate union + Python-side scoring.
+
+        For each layer: query top-K candidates with NO score_threshold (so Qdrant
+        returns the K nearest regardless of score, avoiding version-dependent
+        threshold semantics). Union all candidate block IDs, then compute a
+        weighted combined cosine score in Python using the per-layer weights.
+        Returns the block_id of the best candidate if its combined score >= threshold.
+
+        Args:
+            hidden_vecs:       layer -> normalized [d_model] float32 vector
+            layer_weights:     layer -> weight (should sum to 1.0)
+            threshold:         minimum combined cosine score to flag as duplicate
+            session_id:        scope dedup to this session only
+            top_k_per_layer:   candidates fetched per layer
+        """
+        qdrant_filter = self._build_filter(
+            model_id,
+            {"session_id": session_id} if session_id else None,
+        )
+        collection_name = self._collection_name(model_id)
+
+        # Step 1: collect candidate IDs from all layers (no score threshold)
+        candidate_ids: set[str] = set()
+        for layer, vec in hidden_vecs.items():
+            if layer not in layer_weights or layer_weights[layer] == 0.0:
+                continue
+            results = self.client.query_points(
+                collection_name=collection_name,
+                query=vec.tolist(),
+                using=f"layer_{layer}",
+                limit=top_k_per_layer,
+                query_filter=qdrant_filter,
+                with_vectors=False,
+            ).points
+            for r in results:
+                candidate_ids.add(str(r.id))
+
+        if not candidate_ids:
+            return None
+
+        # Step 2: fetch stored vectors for all candidates
+        candidate_points = self.client.retrieve(
+            collection_name=collection_name,
+            ids=list(candidate_ids),
+            with_vectors=True,
+            with_payload=False,
+        )
+
+        # Step 3: compute weighted combined cosine score in Python
+        best_id: Optional[str] = None
+        best_score = -1.0
+        for point in candidate_points:
+            vectors = point.vector or {}
+            score = 0.0
+            for layer, w in layer_weights.items():
+                key = f"layer_{layer}"
+                if key not in vectors or layer not in hidden_vecs:
+                    continue
+                q = hidden_vecs[layer]
+                k = np.array(vectors[key], dtype=np.float32)
+                score += w * float(np.dot(q, k))
+            if score > best_score:
+                best_score = score
+                best_id = str(point.id)
+
+        if best_score >= threshold:
+            return best_id
+        return None
+
     # ------------------------------------------------------------------
     # Access count update
     # ------------------------------------------------------------------
@@ -380,7 +461,7 @@ class VectorDB:
     @staticmethod
     def _collection_name(model_id: str) -> str:
         """Sanitize model_id to a valid Qdrant collection name."""
-        return model_id.replace("/", "_").replace("\\", "_").replace(":", "_")
+        return sanitize_model_id(model_id)
 
     @staticmethod
     def _build_filter(

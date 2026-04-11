@@ -119,6 +119,14 @@ class MockAdapter(BaseAdapter):
 
         return kv_by_layer, hidden_by_layer
 
+    def capture_batch(
+        self,
+        token_lists: list[list[int]],
+        layers: list[int],
+    ) -> list[tuple[dict, dict]]:
+        """Batch capture — delegates to capture() per item for consistent results."""
+        return [self.capture(tokens=tokens, text="", layers=layers) for tokens in token_lists]
+
     def inject_and_generate(
         self,
         blocks: list[KVBlock],

@@ -29,6 +29,9 @@ class KVMemoryConfig:
     importance_threshold: float = 0.3   # chunks below this score are never stored
     dedup_threshold: float = 0.95       # skip write if similarity > this to existing block
 
+    # Capture batch size — lower = less GPU memory pressure per write call
+    capture_batch_size: int = 8
+
     # Runtime
     async_write: bool = True
 

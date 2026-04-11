@@ -47,6 +47,7 @@ models/
 
 # Benchmark results
 results/
+results*.json
 
 # Notebook checkpoints
 .ipynb_checkpoints/

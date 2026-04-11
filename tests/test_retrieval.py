@@ -29,6 +29,55 @@ from kvmemory.core.retrieval import (
 from kvmemory.storage.schema import KVBlock
 
 
+class TestComputeRetrievalVecFixed:
+    """Fix 1 regression tests: mean-pool replaces broken entropy-softmax pooling."""
+
+    def test_shape_dtype_norm(self):
+        """Fast, no model needed: shape == (d_model,), dtype float32, L2 norm ≈ 1.0."""
+        d_model = 128
+        seq_len = 15
+        hidden = torch.randn(seq_len, d_model)
+        vec = compute_retrieval_vec(hidden, seq_len)
+        assert vec.shape == (d_model,), f"Expected ({d_model},), got {vec.shape}"
+        assert vec.dtype == np.float32, f"Expected float32, got {vec.dtype}"
+        norm = np.linalg.norm(vec)
+        assert abs(norm - 1.0) < 1e-4, f"Not L2-normalized: norm={norm}"
+
+    @pytest.mark.slow
+    def test_discrimination(self):
+        """Slow, requires model: cosine similarity between two different texts < 0.98."""
+        pytest.importorskip("transformers")
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        import torch
+
+        model_name = "sshleifer/tiny-gpt2"
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            model = AutoModelForCausalLM.from_pretrained(model_name)
+            model.eval()
+        except Exception:
+            pytest.skip(f"Model {model_name} unavailable")
+
+        layers = [0]
+
+        def _get_hidden(text: str) -> torch.Tensor:
+            toks = tokenizer.encode(text, return_tensors="pt")
+            with torch.no_grad():
+                out = model(toks, output_hidden_states=True, use_cache=False)
+            return out.hidden_states[1][0].float()  # [seq, d_model]
+
+        hidden_a = _get_hidden("The capital of France is Paris and it is known for the Eiffel Tower.")
+        hidden_b = _get_hidden("Water boils at 100 degrees Celsius at standard atmospheric pressure.")
+
+        vec_a = compute_retrieval_vec(hidden_a, hidden_a.shape[0])
+        vec_b = compute_retrieval_vec(hidden_b, hidden_b.shape[0])
+        cosine_sim = float(np.dot(vec_a, vec_b))
+        assert cosine_sim < 0.98, (
+            f"Vectors are too similar (cosine={cosine_sim:.4f}), "
+            "mean pooling may not be discriminating correctly."
+        )
+
+
 class TestComputeRetrievalVec:
     def test_l2_normalized(self, mock_adapter, base_config):
         tokens = mock_adapter.tokenizer.encode("hello world test sentence here")

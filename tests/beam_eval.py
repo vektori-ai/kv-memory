@@ -30,10 +30,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
 import dataclasses
 import json
 import logging
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -82,7 +84,10 @@ class BEAMResult:
 class BEAMMetrics:
     accuracy_by_type: dict[str, float] = field(default_factory=dict)
     f1_by_type: dict[str, float] = field(default_factory=dict)
-    overall_accuracy: float = 0.0
+    overall_em: float = 0.0
+    em_by_type: dict[str, float] = field(default_factory=dict)
+    correct_rate_by_type: dict[str, float] = field(default_factory=dict)
+    overall_correct_rate: float = 0.0
     overall_f1: float = 0.0
     avg_prefill_tokens: float = 0.0
     avg_latency_ms: float = 0.0
@@ -91,6 +96,7 @@ class BEAMMetrics:
     avg_fetch_ms: float = 0.0
     avg_generate_ms: float = 0.0
     prefill_reduction_pct: float = 0.0   # vs RAG baseline, filled in by print_comparison
+    overall_accuracy: float = 0.0        # alias for overall_em, serialized by dataclasses.asdict()
 
 
 # ------------------------------------------------------------------
@@ -314,16 +320,12 @@ def score_answer(predicted: str, gold: str) -> tuple[float, float]:
     if not pred_tokens or not gold_tokens:
         return em, 0.0
 
-    pred_set = set(pred_tokens)
-    gold_set = set(gold_tokens)
-    common = pred_set & gold_set
-
-    if not common:
-        return em, 0.0
-
-    precision = len(common) / len(pred_set)
-    recall = len(common) / len(gold_set)
-    f1 = 2 * precision * recall / (precision + recall)
+    pred_counter = Counter(pred_tokens)
+    gold_counter = Counter(gold_tokens)
+    common_count = sum((pred_counter & gold_counter).values())
+    precision = common_count / sum(pred_counter.values()) if pred_counter else 0.0
+    recall    = common_count / sum(gold_counter.values()) if gold_counter else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
     return em, f1
 
 
@@ -361,18 +363,55 @@ async def run_kv_memory_eval(
     # ----------------------------------------------------------------
     # Phase 1: store all contexts and drain the write queue
     # ----------------------------------------------------------------
-    logger.info("Phase 1: storing %d contexts...", len(questions))
+    # Qwen2.5-7B (and most HF models) have a hard max_position_embeddings.
+    # Contexts longer than that produce indexing errors in the attention layer.
+    # Truncate to the model's limit before storing — the write pipeline will
+    # chunk it anyway, so we just drop tokens that would be unreachable.
+    tokenizer = memory.adapter.tokenizer
+    _model_max = getattr(tokenizer, "model_max_length", None) or 131072
+    # model_max_length is sometimes set to a huge sentinel (e.g. 1e30); cap sanely.
+    if _model_max > 200_000:
+        _model_max = 131072
+
+    def _truncate_context(text: str) -> str:
+        toks = tokenizer.encode(text)
+        if len(toks) <= _model_max:
+            return text
+        logger.warning(
+            "Context truncated from %d to %d tokens (model max=%d)",
+            len(toks), _model_max, _model_max,
+        )
+        return tokenizer.decode(toks[:_model_max], skip_special_tokens=True)
+
+    # Deduplicate contexts — multiple questions share the same conversation context.
+    # Store each unique context only once to avoid redundant GPU passes + dedup churn.
+    seen_contexts: set[int] = set()
+    unique_questions = []
+    for q in questions:
+        h = hash(q.context)
+        if h not in seen_contexts:
+            seen_contexts.add(h)
+            unique_questions.append(q)
+
+    logger.info(
+        "Phase 1: storing %d unique contexts (from %d questions)...",
+        len(unique_questions), len(questions),
+    )
     if eval_observer:
         eval_observer.emit(
             "phase_started",
             phase="store_contexts",
             benchmark="kv_memory",
             total_questions=len(questions),
+            unique_contexts=len(unique_questions),
             session_id=session_id,
         )
-    for q in questions:
+    for q in unique_questions:
+        # Reset the baseline loss tracker per document so each context gets a
+        # fresh importance baseline rather than inheriting from previous documents.
+        memory.reset_baseline(session_id)
         await memory.store(
-            text=q.context,
+            text=_truncate_context(q.context),
             session_id=session_id,
             trace_context={
                 "run_id": eval_observer.run_id if eval_observer else None,
@@ -382,12 +421,17 @@ async def run_kv_memory_eval(
                 "benchmark": "kv_memory",
             },
             explicit_signal=1.0,   # bypass importance filter — context is always relevant
+            dedup_mode="hash",     # hash dedup: each source chunk appears exactly once
         )
 
     # Drain: wait until every write has landed in Qdrant before asking questions.
     # Without this, generate() would retrieve from an empty collection.
     logger.info("Draining write queue (waiting for Qdrant writes to complete)...")
-    await memory._write_queue.shutdown()
+    await memory.drain_writes()
+    # Reset hash dedup state AFTER drain — not before, to avoid clearing state
+    # for in-flight queued writes.
+    from kvmemory.core.write_pipeline import reset_hash_dedup
+    reset_hash_dedup(memory.config.model_id, session_id)
     if eval_observer:
         eval_observer.emit(
             "phase_finished",
@@ -396,9 +440,6 @@ async def run_kv_memory_eval(
             total_questions=len(questions),
             session_id=session_id,
         )
-    # Restart the queue so the memory object remains usable after eval
-    from kvmemory.core.queue import WriteQueue
-    memory._write_queue = WriteQueue(write_fn=memory._write_fn)
 
     # ----------------------------------------------------------------
     # Phase 2: answer questions with per-stage timing
@@ -431,7 +472,18 @@ async def run_kv_memory_eval(
                 benchmark="kv_memory",
                 question=q.question,
             )
-        tokens = memory.adapter.tokenizer.encode(q.question)
+        # For ANN retrieval — bare question tokens, no chat markers
+        retrieval_tokens = memory.adapter.tokenizer.encode(q.question)
+
+        # For generation — full chat-formatted prompt
+        if hasattr(memory.adapter.tokenizer, "apply_chat_template"):
+            generation_tokens = memory.adapter.tokenizer.apply_chat_template(
+                [{"role": "user", "content": q.question}],
+                tokenize=True, add_generation_prompt=True,
+            )
+        else:
+            generation_tokens = memory.adapter.tokenizer.encode(q.question)  # fallback
+
         session_filter = _build_session_filter(
             model_id=memory.config.model_id,
             session_id=session_id,
@@ -444,7 +496,7 @@ async def run_kv_memory_eval(
         # Stage 1: coarse ANN
         t0 = time.perf_counter()
         candidate_ids, query_vecs = await stage1_coarse(
-            query_tokens=tokens,
+            query_tokens=retrieval_tokens,
             adapter=memory.adapter,
             config=memory.config,
             vector_db=memory.vector_db,
@@ -457,7 +509,8 @@ async def run_kv_memory_eval(
                 benchmark="kv_memory",
                 duration_ms=(t1 - t0) * 1000,
                 candidate_count=len(candidate_ids),
-                query_token_count=len(tokens),
+                query_token_count=len(retrieval_tokens),
+                retrieval_query_token_count=len(retrieval_tokens),
             )
 
         # Stage 2: MMR rerank
@@ -495,7 +548,7 @@ async def run_kv_memory_eval(
         output = inject_and_generate(
             adapter=memory.adapter,
             blocks=blocks,
-            current_tokens=tokens,
+            current_tokens=generation_tokens,
             generation_kwargs=generation_kwargs,
         )
         t4 = time.perf_counter()
@@ -507,7 +560,13 @@ async def run_kv_memory_eval(
                 output_chars=len(output.text),
             )
 
-        em, f1 = score_answer(output.text, q.gold_answer)
+        # Strip the generation prompt from the output before scoring
+        answer_text = memory.adapter.tokenizer.decode(
+            output.sequences[0][len(generation_tokens):],
+            skip_special_tokens=True,
+        )
+
+        em, f1 = score_answer(answer_text, q.gold_answer)
         if question_observer:
             question_observer.emit(
                 "score_done",
@@ -515,17 +574,19 @@ async def run_kv_memory_eval(
                 em_score=em,
                 f1_score=f1,
                 correct=em > 0 or f1 > 0.5,
+                predicted_answer=answer_text,
+                gold_answer=q.gold_answer,
             )
 
         results.append(BEAMResult(
             question_id=q.question_id,
             question_type=q.question_type,
-            predicted_answer=output.text,
+            predicted_answer=answer_text,
             gold_answer=q.gold_answer,
             correct=em > 0 or f1 > 0.5,
             em_score=em,
             f1_score=f1,
-            prefill_tokens=len(tokens),          # only query hits prefill
+            prefill_tokens=len(generation_tokens),   # actual prefill cost
             latency_ms=(t4 - t_start) * 1000,
             stage1_ms=(t1 - t0) * 1000,
             stage2_ms=(t2 - t1) * 1000,
@@ -562,27 +623,84 @@ async def run_kv_memory_eval(
 # RAG baseline
 # ------------------------------------------------------------------
 
+def _rag_chunk_and_retrieve(
+    context_tokens: list[int],
+    query_tokens: list[int],
+    context_budget: int,
+    chunk_size: int = 256,
+) -> list[int]:
+    """
+    Chunk context_tokens into fixed-size chunks, rank by cosine similarity
+    to the query (mean token-ID vectors, no external model), and return the
+    top chunks that fit within context_budget tokens (highest-scored first).
+    """
+    import math
+
+    # Build chunks
+    chunks = [
+        context_tokens[i : i + chunk_size]
+        for i in range(0, len(context_tokens), chunk_size)
+        if context_tokens[i : i + chunk_size]
+    ]
+    if not chunks:
+        return []
+
+    # Vocab size is implicit — we just use raw token IDs as a sparse vector.
+    # mean token ID as a 1-D "embedding" is too weak; instead build a
+    # term-frequency bag-of-words vector over a fixed vocab bucket size.
+    BUCKETS = 8192
+
+    def bow(tokens: list[int]) -> list[float]:
+        vec = [0.0] * BUCKETS
+        for t in tokens:
+            vec[t % BUCKETS] += 1.0
+        norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+        return [v / norm for v in vec]
+
+    q_vec = bow(query_tokens)
+
+    def cosine(chunk_vec: list[float]) -> float:
+        return sum(a * b for a, b in zip(q_vec, chunk_vec))
+
+    scored = sorted(
+        ((cosine(bow(c)), c) for c in chunks),
+        key=lambda x: x[0],
+        reverse=True,
+    )
+
+    selected: list[int] = []
+    used = 0
+    for _, chunk in scored:
+        if used + len(chunk) > context_budget:
+            break
+        selected.extend(chunk)
+        used += len(chunk)
+
+    return selected
+
+
 async def run_rag_baseline(
     questions: list[BEAMQuestion],
     adapter,
     generation_kwargs: Optional[dict] = None,
+    context_tokens: int = 4096,
     observer=None,
 ) -> list[BEAMResult]:
     """
-    RAG baseline: prepend full context as text prefix every turn.
+    RAG baseline: chunk the context, retrieve top chunks by cosine similarity
+    (bag-of-words over token IDs), and prepend them to the query.
 
-    This is the cost we're trying to beat: every question re-prefills
-    the full context from scratch.
+    Context is capped at `context_tokens` so the prefill fits in GPU memory.
     """
     if generation_kwargs is None:
         generation_kwargs = {"max_new_tokens": 50, "do_sample": False}
 
-    baseline_observer = observer.child(phase="rag_baseline", benchmark="rag_baseline") if observer else None
+    baseline_observer = observer.child(phase="lexical_rag_baseline", benchmark="lexical_rag_baseline") if observer else None
     if baseline_observer:
         baseline_observer.emit(
             "phase_started",
-            phase="rag_baseline",
-            benchmark="rag_baseline",
+            phase="lexical_rag_baseline",
+            benchmark="lexical_rag_baseline",
             total_questions=len(questions),
         )
 
@@ -594,56 +712,114 @@ async def run_rag_baseline(
             else None
         )
         if question_observer:
-            question_observer.emit("question_started", benchmark="rag_baseline", question=q.question)
-        context_tokens = adapter.tokenizer.encode(q.context)
-        query_tokens = adapter.tokenizer.encode(q.question)
-        combined = context_tokens + query_tokens
+            question_observer.emit("question_started", benchmark="lexical_rag_baseline", question=q.question)
+
+        # Lexical retrieval — needs bare question token IDs
+        query_retrieval_tokens = adapter.tokenizer.encode(q.question)
+
+        ctx_tokens = adapter.tokenizer.encode(q.context)
+        # Reserve prompt overhead from budget (rough estimate: 50 tokens for template markers)
+        PROMPT_OVERHEAD = 50
+        chunk_budget = max(0, context_tokens - len(query_retrieval_tokens) - PROMPT_OVERHEAD)
+        retrieved_token_ids = _rag_chunk_and_retrieve(ctx_tokens, query_retrieval_tokens, chunk_budget)
+
+        # Build one coherent chat message: context + question
+        retrieved_text = adapter.tokenizer.decode(retrieved_token_ids, skip_special_tokens=True)
+        user_msg = f"Context:\n{retrieved_text}\n\nQuestion:\n{q.question}\nAnswer concisely."
+
+        if hasattr(adapter.tokenizer, "apply_chat_template"):
+            combined_tokens = adapter.tokenizer.apply_chat_template(
+                [{"role": "user", "content": user_msg}],
+                tokenize=True, add_generation_prompt=True,
+            )
+        else:
+            combined_tokens = adapter.tokenizer.encode(user_msg)
+
+        # Final budget guard: if combined_tokens still exceeds limit, trim context and rebuild
+        if len(combined_tokens) > context_tokens:
+            lo, hi = 0, len(retrieved_token_ids)
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                candidate_text = adapter.tokenizer.decode(retrieved_token_ids[:mid], skip_special_tokens=True)
+                candidate_msg = f"Context:\n{candidate_text}\n\nQuestion:\n{q.question}\nAnswer concisely."
+                if hasattr(adapter.tokenizer, "apply_chat_template"):
+                    candidate_toks = adapter.tokenizer.apply_chat_template(
+                        [{"role": "user", "content": candidate_msg}],
+                        tokenize=True, add_generation_prompt=True,
+                    )
+                else:
+                    candidate_toks = adapter.tokenizer.encode(candidate_msg)
+                if len(candidate_toks) <= context_tokens:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            if lo == 0:
+                logger.debug("budget_guard: no context fits within budget, using question-only prompt")
+                retrieved_text = ""
+            else:
+                retrieved_text = adapter.tokenizer.decode(retrieved_token_ids[:lo], skip_special_tokens=True)
+            user_msg = f"Context:\n{retrieved_text}\n\nQuestion:\n{q.question}\nAnswer concisely."
+            if hasattr(adapter.tokenizer, "apply_chat_template"):
+                combined_tokens = adapter.tokenizer.apply_chat_template(
+                    [{"role": "user", "content": user_msg}],
+                    tokenize=True, add_generation_prompt=True,
+                )
+            else:
+                combined_tokens = adapter.tokenizer.encode(user_msg)
 
         t0 = time.perf_counter()
-        output = adapter.inject_and_generate([], combined, generation_kwargs)
+        output = adapter.inject_and_generate([], combined_tokens, generation_kwargs)
         latency_ms = (time.perf_counter() - t0) * 1000
         if question_observer:
             question_observer.emit(
                 "generation_done",
-                benchmark="rag_baseline",
+                benchmark="lexical_rag_baseline",
                 duration_ms=latency_ms,
                 output_chars=len(output.text),
             )
 
-        em, f1 = score_answer(output.text, q.gold_answer)
+        # Strip prompt from output before scoring
+        rag_answer_text = adapter.tokenizer.decode(
+            output.sequences[0][len(combined_tokens):],
+            skip_special_tokens=True,
+        )
+
+        em, f1 = score_answer(rag_answer_text, q.gold_answer)
         if question_observer:
             question_observer.emit(
                 "score_done",
-                benchmark="rag_baseline",
+                benchmark="lexical_rag_baseline",
                 em_score=em,
                 f1_score=f1,
                 correct=em > 0 or f1 > 0.5,
+                predicted_answer=rag_answer_text,
+                gold_answer=q.gold_answer,
             )
 
         results.append(BEAMResult(
             question_id=q.question_id,
             question_type=q.question_type,
-            predicted_answer=output.text,
+            predicted_answer=rag_answer_text,
             gold_answer=q.gold_answer,
             correct=em > 0 or f1 > 0.5,
             em_score=em,
             f1_score=f1,
-            prefill_tokens=len(combined),   # RAG pays full context every turn
+            prefill_tokens=len(combined_tokens),
             latency_ms=latency_ms,
         ))
         if question_observer:
             question_observer.emit(
                 "question_finished",
-                benchmark="rag_baseline",
+                benchmark="lexical_rag_baseline",
                 latency_ms=latency_ms,
-                prefill_tokens=len(combined),
+                prefill_tokens=len(combined_tokens),
             )
 
     if baseline_observer:
         baseline_observer.emit(
             "phase_finished",
-            phase="rag_baseline",
-            benchmark="rag_baseline",
+            phase="lexical_rag_baseline",
+            benchmark="lexical_rag_baseline",
             total_questions=len(results),
         )
     return results
@@ -694,20 +870,57 @@ async def run_sliding_window_baseline(
                 benchmark="sliding_window_baseline",
                 question=q.question,
             )
-        context_tokens = adapter.tokenizer.encode(q.context)
-        query_tokens = adapter.tokenizer.encode(q.question)
+        query_retrieval_tokens = adapter.tokenizer.encode(q.question)
+        context_token_ids = adapter.tokenizer.encode(q.context)
 
-        # Truncate context to fit window, keeping the most recent tokens
-        available = window_tokens - len(query_tokens)
-        if available > 0:
-            window = context_tokens[-available:]
+        PROMPT_OVERHEAD = 50
+        available = window_tokens - len(query_retrieval_tokens) - PROMPT_OVERHEAD
+        window_ids = context_token_ids[-available:] if available > 0 else []
+        window_text = adapter.tokenizer.decode(window_ids, skip_special_tokens=True)
+
+        sw_user_msg = f"Context:\n{window_text}\n\nQuestion:\n{q.question}\nAnswer concisely."
+        if hasattr(adapter.tokenizer, "apply_chat_template"):
+            combined_tokens = adapter.tokenizer.apply_chat_template(
+                [{"role": "user", "content": sw_user_msg}],
+                tokenize=True, add_generation_prompt=True,
+            )
         else:
-            window = []
+            combined_tokens = adapter.tokenizer.encode(sw_user_msg)
 
-        combined = window + query_tokens
+        # Final budget guard: binary-search the maximum tail of context_token_ids that fits.
+        if len(combined_tokens) > window_tokens:
+            lo, hi = 0, len(context_token_ids)
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                candidate_text = adapter.tokenizer.decode(context_token_ids[-mid:], skip_special_tokens=True)
+                candidate_msg = f"Context:\n{candidate_text}\n\nQuestion:\n{q.question}\nAnswer concisely."
+                if hasattr(adapter.tokenizer, "apply_chat_template"):
+                    candidate_toks = adapter.tokenizer.apply_chat_template(
+                        [{"role": "user", "content": candidate_msg}],
+                        tokenize=True, add_generation_prompt=True,
+                    )
+                else:
+                    candidate_toks = adapter.tokenizer.encode(candidate_msg)
+                if len(candidate_toks) <= window_tokens:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            if lo == 0:
+                logger.debug("budget_guard: no context fits within budget, using question-only prompt")
+                window_text = ""
+            else:
+                window_text = adapter.tokenizer.decode(context_token_ids[-lo:], skip_special_tokens=True)
+            sw_user_msg = f"Context:\n{window_text}\n\nQuestion:\n{q.question}\nAnswer concisely."
+            if hasattr(adapter.tokenizer, "apply_chat_template"):
+                combined_tokens = adapter.tokenizer.apply_chat_template(
+                    [{"role": "user", "content": sw_user_msg}],
+                    tokenize=True, add_generation_prompt=True,
+                )
+            else:
+                combined_tokens = adapter.tokenizer.encode(sw_user_msg)
 
         t0 = time.perf_counter()
-        output = adapter.inject_and_generate([], combined, generation_kwargs)
+        output = adapter.inject_and_generate([], combined_tokens, generation_kwargs)
         latency_ms = (time.perf_counter() - t0) * 1000
         if question_observer:
             question_observer.emit(
@@ -717,7 +930,13 @@ async def run_sliding_window_baseline(
                 output_chars=len(output.text),
             )
 
-        em, f1 = score_answer(output.text, q.gold_answer)
+        # Strip prompt from output before scoring
+        sw_answer_text = adapter.tokenizer.decode(
+            output.sequences[0][len(combined_tokens):],
+            skip_special_tokens=True,
+        )
+
+        em, f1 = score_answer(sw_answer_text, q.gold_answer)
         if question_observer:
             question_observer.emit(
                 "score_done",
@@ -725,17 +944,19 @@ async def run_sliding_window_baseline(
                 em_score=em,
                 f1_score=f1,
                 correct=em > 0 or f1 > 0.5,
+                predicted_answer=sw_answer_text,
+                gold_answer=q.gold_answer,
             )
 
         results.append(BEAMResult(
             question_id=q.question_id,
             question_type=q.question_type,
-            predicted_answer=output.text,
+            predicted_answer=sw_answer_text,
             gold_answer=q.gold_answer,
             correct=em > 0 or f1 > 0.5,
             em_score=em,
             f1_score=f1,
-            prefill_tokens=len(combined),
+            prefill_tokens=len(combined_tokens),
             latency_ms=latency_ms,
         ))
         if question_observer:
@@ -743,7 +964,7 @@ async def run_sliding_window_baseline(
                 "question_finished",
                 benchmark="sliding_window_baseline",
                 latency_ms=latency_ms,
-                prefill_tokens=len(combined),
+                prefill_tokens=len(combined_tokens),
             )
 
     if baseline_observer:
@@ -777,12 +998,22 @@ def compute_metrics(results: list[BEAMResult]) -> BEAMMetrics:
         qt: sum(r.f1_score for r in rs) / len(rs)
         for qt, rs in by_type.items()
     }
+    em_by_type = accuracy_by_type  # EM == accuracy
+    correct_rate_by_type = {
+        qt: sum(1 for r in rs if r.em_score > 0 or r.f1_score > 0.5) / len(rs)
+        for qt, rs in by_type.items()
+    }
 
     n = len(results)
+    overall_em = sum(r.em_score for r in results) / n
+    overall_correct_rate = sum(1 for r in results if r.em_score > 0 or r.f1_score > 0.5) / n
     return BEAMMetrics(
         accuracy_by_type=accuracy_by_type,
         f1_by_type=f1_by_type,
-        overall_accuracy=sum(r.em_score for r in results) / n,
+        overall_em=overall_em,
+        em_by_type=em_by_type,
+        correct_rate_by_type=correct_rate_by_type,
+        overall_correct_rate=overall_correct_rate,
         overall_f1=sum(r.f1_score for r in results) / n,
         avg_prefill_tokens=sum(r.prefill_tokens for r in results) / n,
         avg_latency_ms=sum(r.latency_ms for r in results) / n,
@@ -790,6 +1021,7 @@ def compute_metrics(results: list[BEAMResult]) -> BEAMMetrics:
         avg_stage2_ms=sum(r.stage2_ms for r in results) / n,
         avg_fetch_ms=sum(r.fetch_ms for r in results) / n,
         avg_generate_ms=sum(r.generate_ms for r in results) / n,
+        overall_accuracy=overall_em,
     )
 
 
@@ -798,28 +1030,32 @@ def print_comparison(
     rag_metrics: BEAMMetrics,
     sw_metrics: Optional[BEAMMetrics] = None,
 ) -> None:
-    W = 65
-    cols = ["KV Memory", "RAG"]
+    W = 72
+    cols = ["KV Memory", "Lexical RAG"]
     if sw_metrics:
         cols.append("Sliding Win")
 
     def row(label, *vals):
         fmt = f"  {{:<33}}"
         for v in vals:
-            fmt += " {:>12}"
+            fmt += " {:>14}"
         print(fmt.format(label, *vals))
 
     print(f"\n{'=' * W}")
     print("BEAM Benchmark Results")
     print(f"{'=' * W}")
-    print(f"  {'Metric':<33} {'KV Memory':>12} {'RAG':>12}" +
-          (f" {'Sliding Win':>12}" if sw_metrics else ""))
+    print(f"  {'Metric':<33} {'KV Memory':>14} {'Lexical RAG':>14}" +
+          (f" {'Sliding Win':>14}" if sw_metrics else ""))
     print(f"  {'-' * (W - 2)}")
 
-    row("Overall EM",
-        f"{kv_metrics.overall_accuracy:.1%}",
-        f"{rag_metrics.overall_accuracy:.1%}",
-        *([f"{sw_metrics.overall_accuracy:.1%}"] if sw_metrics else []))
+    row("Exact Match (EM)",
+        f"{kv_metrics.overall_em:.1%}",
+        f"{rag_metrics.overall_em:.1%}",
+        *([f"{sw_metrics.overall_em:.1%}"] if sw_metrics else []))
+    row("Correct Rate (EM or F1>0.5)",
+        f"{kv_metrics.overall_correct_rate:.1%}",
+        f"{rag_metrics.overall_correct_rate:.1%}",
+        *([f"{sw_metrics.overall_correct_rate:.1%}"] if sw_metrics else []))
     row("Overall F1",
         f"{kv_metrics.overall_f1:.1%}",
         f"{rag_metrics.overall_f1:.1%}",
@@ -875,6 +1111,9 @@ async def main(args) -> None:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # httpcore/httpx are extremely chatty at DEBUG; cap them at WARNING
+    for _noisy in ("httpcore", "httpx", "hpack"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
     from kvmemory import KVMemory, KVMemoryConfig, ObservabilityStore
     from kvmemory.adapters.hf_adapter import HFAdapter
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -897,6 +1136,20 @@ async def main(args) -> None:
         },
         metadata={"dataset_source": dataset_source, "run_kind": "beam_benchmark"},
     )
+
+    # Safe atexit handler: marks the run as failed if process exits unexpectedly.
+    # Note: atexit won't catch SIGKILL or CUDA process death — stale-run detection
+    # in list_runs() handles those cases.
+    _run_finished = False
+
+    def _atexit_handler():
+        if not _run_finished:
+            try:
+                run_observer.fail(error="process terminated unexpectedly")
+            except Exception:
+                pass  # atexit cannot propagate exceptions
+
+    atexit.register(_atexit_handler)
 
     memory = None
     try:
@@ -962,12 +1215,22 @@ async def main(args) -> None:
             device=device,
         )
 
-        config = KVMemoryConfig(
-            model_id=args.model.replace("/", "_"),
+        from kvmemory.utils.model_id import sanitize_model_id
+        # After Fixes 1, 8, 9, 18, wipe stale data before a real benchmark run:
+        #   Qdrant:    vector_db.delete_collection(sanitize_model_id(args.model))
+        #   Blob store: rename/move ./kv_store/<sanitize_model_id(args.model)>/ to a backup dir
+        # Do NOT auto-delete. Wipe manually once, then re-run.
+        config_kwargs = dict(
+            model_id=sanitize_model_id(args.model),
             retrieval_layers=args.retrieval_layers,
             token_budget=args.token_budget,
             importance_threshold=0.0 if args.synthetic else 0.3,
         )
+        if args.dedup_threshold is not None:
+            config_kwargs["dedup_threshold"] = args.dedup_threshold
+        if args.capture_batch_size is not None:
+            config_kwargs["capture_batch_size"] = args.capture_batch_size
+        config = KVMemoryConfig(**config_kwargs)
         memory = KVMemory(adapter=adapter, config=config, observer=run_observer)
         gen_kwargs = {"max_new_tokens": args.max_new_tokens, "do_sample": False}
         benchmark_session_id = f"beam_{run_observer.run_id}"
@@ -982,11 +1245,12 @@ async def main(args) -> None:
             observer=run_observer,
         )
 
-        logger.info("Running RAG baseline...")
+        logger.info("Running Lexical RAG baseline...")
         rag_results = await run_rag_baseline(
             questions,
             adapter,
             generation_kwargs=gen_kwargs,
+            context_tokens=args.rag_context_tokens,
             observer=run_observer,
         )
 
@@ -1007,8 +1271,11 @@ async def main(args) -> None:
         summary = {
             "question_count": len(questions),
             "kv_metrics": dataclasses.asdict(kv_metrics),
-            "rag_metrics": dataclasses.asdict(rag_metrics),
+            "lexical_rag_metrics": dataclasses.asdict(rag_metrics),
             "sliding_window_metrics": dataclasses.asdict(sw_metrics),
+            "kv_results": [dataclasses.asdict(r) for r in kv_results],
+            "lexical_rag_results": [dataclasses.asdict(r) for r in rag_results],
+            "sliding_window_results": [dataclasses.asdict(r) for r in sw_results],
         }
         run_observer.update_summary(**summary)
 
@@ -1017,6 +1284,7 @@ async def main(args) -> None:
             logger.info("Results saved to %s", args.output)
             run_observer.emit("results_saved", output_path=args.output)
 
+        _run_finished = True
         run_observer.finish(summary=summary)
     except Exception as exc:
         run_observer.emit(
@@ -1027,6 +1295,7 @@ async def main(args) -> None:
             error=str(exc),
             error_type=type(exc).__name__,
         )
+        _run_finished = True
         run_observer.fail(error=str(exc), error_type=type(exc).__name__)
         raise
     finally:
@@ -1036,27 +1305,19 @@ async def main(args) -> None:
 
 def _save_results(path, kv_results, rag_results, sw_results,
                   kv_metrics, rag_metrics, sw_metrics) -> None:
-    import dataclasses
-
-    def metrics_dict(m):
-        return dataclasses.asdict(m)
-
-    def results_list(rs):
-        return [dataclasses.asdict(r) for r in rs]
-
     with open(path, "w") as f:
         json.dump({
             "kv_memory": {
-                "metrics": metrics_dict(kv_metrics),
-                "results": results_list(kv_results),
+                "metrics": dataclasses.asdict(kv_metrics),
+                "results": [dataclasses.asdict(r) for r in kv_results],
             },
-            "rag_baseline": {
-                "metrics": metrics_dict(rag_metrics),
-                "results": results_list(rag_results),
+            "lexical_rag_baseline": {
+                "metrics": dataclasses.asdict(rag_metrics),
+                "results": [dataclasses.asdict(r) for r in rag_results],
             },
             "sliding_window": {
-                "metrics": metrics_dict(sw_metrics),
-                "results": results_list(sw_results),
+                "metrics": dataclasses.asdict(sw_metrics),
+                "results": [dataclasses.asdict(r) for r in sw_results],
             },
         }, f, indent=2)
 
@@ -1085,7 +1346,18 @@ if __name__ == "__main__":
                         help="Layers to use for retrieval (default: 8 16 24)")
     parser.add_argument("--token-budget", type=int, default=2000,
                         help="Hard cap on injected tokens (default: 2000)")
+    parser.add_argument("--rag-context-tokens", type=int, default=4096,
+                        help="Max context tokens for RAG baseline (default: 4096)")
     parser.add_argument("--max-new-tokens", type=int, default=50)
+    parser.add_argument("--capture-batch-size", type=int, default=None,
+                        help="Chunks captured per GPU forward pass (default: 8). "
+                             "Lower = less GPU memory pressure.")
+    parser.add_argument("--dedup-threshold", type=float, default=None,
+                        help="Semantic dedup threshold (minimum cosine score to flag a chunk as "
+                             "duplicate; higher = fewer duplicates removed). "
+                             "Default: use KVMemoryConfig default (0.95). "
+                             "Note: this is a MINIMUM score threshold — lower values cause MORE "
+                             "chunks to be flagged as duplicates.")
     parser.add_argument("--dtype", default="float16",
                         choices=["float16", "bfloat16", "float32"],
                         help="Model weight dtype (default: float16)")

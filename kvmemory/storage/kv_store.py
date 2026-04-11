@@ -19,6 +19,7 @@ import time
 from typing import Optional
 
 from ..storage.schema import KVBlock
+from ..utils.model_id import sanitize_model_id
 
 logger = logging.getLogger(__name__)
 
@@ -123,9 +124,7 @@ class KVStore:
     # ------------------------------------------------------------------
 
     def _block_dir(self, model_id: str) -> str:
-        # Sanitize model_id to be a valid directory name
-        safe_model_id = model_id.replace("/", "_").replace("\\", "_")
-        return os.path.join(self.blob_store_path, safe_model_id)
+        return os.path.join(self.blob_store_path, sanitize_model_id(model_id))
 
     def _block_path(self, model_id: str, block_id: str) -> str:
         return os.path.join(self._block_dir(model_id), f"{block_id}.pkl")

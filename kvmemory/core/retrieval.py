@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 import torch
-import torch.nn.functional as F
+import torch.nn.functional as F  # used by stage2_rerank_mmr (normalize)
 
 if TYPE_CHECKING:
     from ..adapters.base import BaseAdapter
@@ -36,11 +36,15 @@ def compute_retrieval_vec(
     """
     Compute a single normalized retrieval vector from a hidden state tensor.
 
-    Three steps, in exact order per the spec:
-      1. Weighted mean pool (attention entropy as salience weight)
-         Low entropy -> salient token -> high weight
-      2. sqrt(n) length normalization (removes chunk length bias)
-      3. L2 normalization (stable cosine comparison)
+    Steps:
+      1. Unweighted mean pool over sequence dimension — simple and proven.
+         (Previous entropy-softmax weighting was broken: softmax over d_model
+         dims ~3584 produces a near-flat distribution for every token, making
+         all entropies near-identical and all salience weights near-uniform,
+         which destroyed inter-chunk discrimination.)
+      2. sqrt(n) length normalization (harmless after L2 norm; does not change
+         final cosine direction, kept for compatibility)
+      3. L2 normalization (stable cosine comparison in Qdrant)
 
     Args:
         hidden:      [seq, d_model] float32 tensor
@@ -52,15 +56,8 @@ def compute_retrieval_vec(
     if hidden.dim() != 2:
         raise ValueError(f"Expected [seq, d_model], got {hidden.shape}")
 
-    # Step 1: Entropy-based salience weighting
-    # Entropy of softmax over hidden dimensions as a proxy for token salience
-    # Low entropy = peaked distribution = salient token
-    probs = F.softmax(hidden, dim=-1)  # [seq, d_model]
-    entropy = -(probs * (probs + 1e-9).log()).sum(dim=-1)  # [seq]
-    weights = F.softmax(-entropy, dim=0)  # [seq], low entropy -> high weight
-
-    # Weighted mean pool
-    pooled = (weights.unsqueeze(-1) * hidden).sum(0)  # [d_model]
+    # Step 1: Simple unweighted mean pool
+    pooled = hidden.mean(dim=0)   # [d_model]
 
     # Step 2: sqrt(n) length normalization
     pooled = pooled / math.sqrt(max(token_count, 1))
@@ -216,6 +213,10 @@ def stage2_rerank_mmr(
         # Hard token budget enforcement (non-negotiable per spec)
         if tokens_used + n_tokens > token_budget:
             # Skip this block but keep looking — a smaller block might fit
+            logger.debug(
+                "MMR: block %s skipped — %d tokens > %d remaining budget",
+                best["id"], n_tokens, token_budget - tokens_used,
+            )
             remaining.remove(best)
             continue
 

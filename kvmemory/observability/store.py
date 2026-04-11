@@ -293,6 +293,11 @@ class ObservabilityStore:
                     continue
                 if start_before is not None and started_at is not None and started_at > start_before:
                     continue
+                # Mark runs that appear stuck as stale (no disk mutation)
+                if doc.get("status") == "running":
+                    last_event_at = doc.get("last_event_at")
+                    if last_event_at is not None and time.time() - last_event_at > 7200:
+                        doc["stale"] = True
                 runs.append(doc)
 
         runs.sort(key=lambda item: item.get("started_at") or 0.0, reverse=True)

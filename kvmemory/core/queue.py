@@ -70,6 +70,7 @@ class WriteQueue:
         explicit_signal: float = 0.0,
         observer: Optional["RunObserver"] = None,
         trace_context: Optional[dict[str, Any]] = None,
+        dedup_mode: str = "semantic",
     ) -> None:
         """
         Enqueue a write task. Returns immediately — never blocks.
@@ -83,6 +84,7 @@ class WriteQueue:
             agent_id:        optional agent identifier
             shared:          whether to allow cross-agent retrieval of this turn
             explicit_signal: 1.0 if user flagged 'remember this'
+            dedup_mode:      "semantic" or "hash"
         """
         if not self._running:
             self.start()
@@ -98,9 +100,27 @@ class WriteQueue:
                 explicit_signal,
                 observer,
                 trace_context,
+                dedup_mode,
             )
         )
         logger.debug("WriteQueue.enqueue: session=%s, tokens=%d", session_id, len(tokens))
+
+    async def drain(self, timeout: float | None = None) -> None:
+        """
+        Wait until all currently queued writes have been processed.
+
+        Does NOT stop the worker — the queue remains usable for new writes
+        after drain() returns. Use shutdown() to fully stop the worker.
+
+        Args:
+            timeout: max seconds to wait (None = wait forever)
+        """
+        if not self._running:
+            return
+        if timeout is None:
+            await self._queue.join()
+        else:
+            await asyncio.wait_for(self._queue.join(), timeout=timeout)
 
     async def shutdown(self, timeout: float = 10.0) -> None:
         """
@@ -156,6 +176,7 @@ class WriteQueue:
                 explicit_signal,
                 observer,
                 trace_context,
+                dedup_mode,
             ) = item
             try:
                 await self._write_fn(
@@ -169,6 +190,7 @@ class WriteQueue:
                     explicit_signal,
                     observer,
                     trace_context,
+                    dedup_mode,
                 )
             except Exception as e:
                 logger.error(

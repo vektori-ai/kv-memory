@@ -253,12 +253,19 @@ class KVMemory:
         shared: bool = False,
         explicit_signal: float = 1.0,
         trace_context: Optional[dict] = None,
+        dedup_mode: str = "semantic",
     ) -> None:
         """
         Manually store text into memory without generating a response.
 
         Useful for seeding memory with known facts or previous context.
         explicit_signal=1.0 bypasses the importance filter.
+
+        Args:
+            dedup_mode: "semantic" (default) or "hash". Pass "hash" for bulk
+                        ingestion of unique-per-source text (e.g. BEAM contexts)
+                        to avoid semantic collapse. Reset with reset_hash_dedup()
+                        after drain_writes() completes.
         """
         tokens = self.adapter.tokenizer.encode(text)
         observer = None
@@ -280,6 +287,7 @@ class KVMemory:
             explicit_signal=explicit_signal,
             observer=observer,
             trace_context=trace_context,
+            dedup_mode=dedup_mode,
         )
         if observer:
             observer.emit(
@@ -288,6 +296,28 @@ class KVMemory:
                 token_count=len(tokens),
                 queue_depth=self._write_queue.pending,
             )
+
+    def reset_baseline(self, session_id: str) -> None:
+        """Remove the baseline loss tracker for a session.
+
+        Call this before storing each new document to prevent the importance
+        scorer from treating the first document's loss distribution as the
+        baseline for all subsequent documents.
+        """
+        from .core.write_pipeline import _baseline_trackers
+        _baseline_trackers.pop(session_id, None)
+
+    async def drain_writes(self, timeout: float | None = None) -> None:
+        """
+        Wait until all queued writes have landed in Qdrant/blob store.
+
+        Does NOT stop the write queue — the memory object remains fully usable
+        after this call. Use close() to fully shut down.
+
+        Args:
+            timeout: max seconds to wait (None = wait forever)
+        """
+        await self._write_queue.drain(timeout=timeout)
 
     async def close(self) -> None:
         """Drain pending writes and shut down the write queue."""
@@ -309,6 +339,7 @@ class KVMemory:
         explicit_signal: float = 0.0,
         observer: Optional[RunObserver] = None,
         trace_context: Optional[dict] = None,
+        dedup_mode: str = "semantic",
     ) -> None:
         """Write pipeline entrypoint called by the queue worker."""
         await run_write_pipeline(
@@ -324,6 +355,7 @@ class KVMemory:
             explicit_signal=explicit_signal,
             observer=observer,
             trace_context=trace_context,
+            dedup_mode=dedup_mode,
         )
 
     async def _increment_access_counts(self, block_ids: list[str]) -> None:

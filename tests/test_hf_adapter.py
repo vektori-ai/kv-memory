@@ -279,6 +279,79 @@ class TestKVStoreWriteRead:
 
 
 # ------------------------------------------------------------------
+# Capture parity: capture() vs capture_batch()[0]
+# ------------------------------------------------------------------
+
+class TestCaptureParity:
+    """Fix 15: capture() must be numerically consistent with capture_batch([tokens])[0]."""
+
+    def test_same_layers_returned(self, mock_adapter, base_config):
+        """Both paths must return the same layer keys."""
+        tokens = mock_adapter.tokenizer.encode("hello world test sentence")
+        layers = base_config.retrieval_layers
+
+        kv_single, hidden_single = mock_adapter.capture(tokens=tokens, text="", layers=layers)
+        batch_results = mock_adapter.capture_batch([tokens], layers=layers)
+        kv_batch, hidden_batch = batch_results[0]
+
+        assert set(kv_single.keys()) == set(kv_batch.keys()), "Layer keys differ"
+        assert set(hidden_single.keys()) == set(hidden_batch.keys()), "Hidden layer keys differ"
+
+    def test_same_tensor_shapes(self, mock_adapter, base_config):
+        """Both paths must return tensors of identical shape."""
+        tokens = mock_adapter.tokenizer.encode("test tokens here please")
+        layers = base_config.retrieval_layers
+
+        kv_single, hidden_single = mock_adapter.capture(tokens=tokens, text="", layers=layers)
+        kv_batch, hidden_batch = mock_adapter.capture_batch([tokens], layers=layers)[0]
+
+        for layer in layers:
+            K_s, V_s = kv_single[layer]
+            K_b, V_b = kv_batch[layer]
+            assert K_s.shape == K_b.shape, f"Layer {layer} K shape: {K_s.shape} vs {K_b.shape}"
+            assert V_s.shape == V_b.shape, f"Layer {layer} V shape: {V_s.shape} vs {V_b.shape}"
+            assert hidden_single[layer].shape == hidden_batch[layer].shape
+
+    @pytest.mark.slow
+    def test_numerical_parity_real_model(self):
+        """Slow: capture() and capture_batch()[0] must agree numerically on tiny-gpt2."""
+        pytest.importorskip("transformers")
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        model_name = "sshleifer/tiny-gpt2"
+        try:
+            model = AutoModelForCausalLM.from_pretrained(model_name)
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            tokenizer.pad_token = tokenizer.eos_token
+        except Exception:
+            pytest.skip(f"Model {model_name} unavailable")
+
+        adapter = HFAdapter(model, tokenizer)
+        layers = [0, 1]
+        tokens = tokenizer.encode("The capital of France is Paris.")
+
+        kv_single, hidden_single = adapter.capture(tokens=tokens, text="", layers=layers)
+        kv_batch, hidden_batch = adapter.capture_batch([tokens], layers=layers)[0]
+
+        for layer in layers:
+            h_s = hidden_single[layer].float().numpy()
+            h_b = hidden_batch[layer].float().numpy()
+            max_diff = float(np.abs(h_s - h_b).max())
+            assert max_diff < 1e-4, (
+                f"Hidden state mismatch at layer {layer}: max_diff={max_diff:.6f}. "
+                "capture() and capture_batch() are not numerically consistent."
+            )
+
+            K_s, V_s = kv_single[layer]
+            K_b, V_b = kv_batch[layer]
+            # KV tensors are torch.Tensor here (pre-quantization)
+            kv_diff = float(torch.abs(K_s.float() - K_b.float()).max())
+            assert kv_diff < 1e-4, (
+                f"KV tensor mismatch at layer {layer}: max_diff={kv_diff:.6f}"
+            )
+
+
+# ------------------------------------------------------------------
 # Real HF model tests (slow, requires GPU + model download)
 # ------------------------------------------------------------------
 

@@ -88,50 +88,47 @@ class HFAdapter(BaseAdapter):
         dict[int, torch.Tensor],
     ]:
         """
-        Single forward pass to extract KV tensors and hidden states.
+        Independent single-item forward pass to extract KV tensors and hidden states.
+
+        Uses its own direct forward pass (not delegating to capture_batch) so that
+        the fallback path in write_pipeline does not share the same code path as
+        the primary batch path (if capture_batch fails, capture() may still succeed).
 
         Returns tensors with batch dim removed (squeezed).
-        K/V: [heads, seq, head_dim] float16
+        K/V: [kv_heads, seq, head_dim]
         hidden: [seq, d_model] float32
         """
         if not tokens:
             raise ValueError("capture() called with empty token list")
 
-        input_ids = torch.tensor([tokens], dtype=torch.long).to(self.model.device)
+        device = self.model.device
+        seq_len = len(tokens)
+        input_ids = torch.tensor([tokens], dtype=torch.long, device=device)  # [1, seq_len]
+        attn_mask = torch.ones_like(input_ids)
 
         with torch.no_grad():
             out = self.model(
                 input_ids=input_ids,
+                attention_mask=attn_mask,
                 output_hidden_states=True,
                 output_attentions=False,
                 use_cache=True,
             )
 
-        # Normalize past_key_values to a list of (K, V) tuples — one per layer.
-        # K/V shape from HF: [batch=1, kv_heads, seq, head_dim]
-        #
-        # transformers 5.x:  DynamicCache with .layers list; each DynamicLayer has .keys/.values
-        # transformers 4.38+: DynamicCache with .to_legacy_cache() or .key_cache/.value_cache
-        # transformers <4.38: legacy tuple of (K, V) per layer (directly subscriptable)
+        # Normalise past_key_values (same logic as capture_batch)
         pkv = out.past_key_values
         if hasattr(pkv, "layers") and pkv.layers:
-            # transformers 5.x
             pkv_list: list[tuple[torch.Tensor, torch.Tensor]] = [
                 (layer.keys, layer.values)
                 for layer in pkv.layers
                 if getattr(layer, "is_initialized", True) and hasattr(layer, "keys")
             ]
-            logger.debug("capture: transformers 5.x DynamicCache, %d layers", len(pkv_list))
         elif hasattr(pkv, "to_legacy_cache"):
-            # transformers 4.38–4.x
             pkv_list = list(pkv.to_legacy_cache())
-            logger.debug("capture: transformers 4.x DynamicCache (to_legacy_cache), %d layers", len(pkv_list))
         elif hasattr(pkv, "key_cache"):
             pkv_list = list(zip(pkv.key_cache, pkv.value_cache))
-            logger.debug("capture: transformers 4.x DynamicCache (key_cache), %d layers", len(pkv_list))
         else:
             pkv_list = list(pkv)
-            logger.debug("capture: legacy tuple cache, %d layers", len(pkv_list))
 
         kv_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         for layer_idx in layers:
@@ -141,26 +138,125 @@ class HFAdapter(BaseAdapter):
                     layer_idx, len(pkv_list),
                 )
                 continue
-            K = pkv_list[layer_idx][0].squeeze(0)  # [kv_heads, seq, head_dim]
-            V = pkv_list[layer_idx][1].squeeze(0)
+            K = pkv_list[layer_idx][0][0, :, :seq_len, :]  # [kv_heads, seq_len, head_dim]
+            V = pkv_list[layer_idx][1][0, :, :seq_len, :]
             kv_by_layer[layer_idx] = (K, V)
 
-        # hidden_states: tuple of tensors [batch, seq, d_model], one per layer + embedding
-        # Index offset: hidden_states[0] is embedding, hidden_states[l+1] is layer l output
         hidden_by_layer: dict[int, torch.Tensor] = {}
         for layer_idx in layers:
-            hs_idx = layer_idx + 1  # +1 because index 0 is the embedding layer
+            hs_idx = layer_idx + 1  # hidden_states[0] is embedding layer
             if hs_idx >= len(out.hidden_states):
                 logger.warning(
                     "Hidden state index %d out of range, skipping layer %d",
-                    hs_idx,
-                    layer_idx,
+                    hs_idx, layer_idx,
                 )
                 continue
-            hidden = out.hidden_states[hs_idx].squeeze(0).float()  # [seq, d_model]
+            hidden = out.hidden_states[hs_idx][0, :seq_len, :].float()  # [seq_len, d_model]
             hidden_by_layer[layer_idx] = hidden
 
         return kv_by_layer, hidden_by_layer
+
+    def capture_batch(
+        self,
+        batch_tokens: list[list[int]],
+        layers: list[int],
+    ) -> list[tuple[
+        dict[int, tuple[torch.Tensor, torch.Tensor]],
+        dict[int, torch.Tensor],
+    ]]:
+        """
+        Batched forward pass: process multiple chunks in one model() call.
+
+        Chunks are right-padded to the longest sequence in the batch.
+        Padding positions are masked out and never appear in the returned
+        KV/hidden tensors — each result is sliced to its original length.
+
+        Args:
+            batch_tokens: list of token-ID lists, one per chunk
+            layers:       which layers to extract KV + hidden states from
+
+        Returns:
+            List of (kv_by_layer, hidden_by_layer) — one entry per chunk,
+            in the same order as batch_tokens. Shapes match single capture():
+              K/V:    [kv_heads, seq_i, head_dim]
+              hidden: [seq_i, d_model] float32
+        """
+        if not batch_tokens:
+            return []
+
+        device = self.model.device
+        lengths = [len(t) for t in batch_tokens]
+        max_len = max(lengths)
+        pad_id = getattr(self._tokenizer, "pad_token_id", None) or 0
+
+        # Right-pad all sequences to max_len
+        padded = [t + [pad_id] * (max_len - len(t)) for t in batch_tokens]
+        input_ids = torch.tensor(padded, dtype=torch.long, device=device)  # [B, max_len]
+
+        # Attention mask: 1 for real tokens, 0 for padding
+        attn_mask = torch.zeros_like(input_ids)
+        for i, length in enumerate(lengths):
+            attn_mask[i, :length] = 1
+
+        with torch.no_grad():
+            out = self.model(
+                input_ids=input_ids,
+                attention_mask=attn_mask,
+                output_hidden_states=True,
+                output_attentions=False,
+                use_cache=True,
+            )
+
+        # Normalise past_key_values to a flat list of (K, V) per layer.
+        # K/V shape from HF: [batch, kv_heads, seq, head_dim]
+        pkv = out.past_key_values
+        if hasattr(pkv, "layers") and pkv.layers:
+            pkv_list: list[tuple[torch.Tensor, torch.Tensor]] = [
+                (layer.keys, layer.values)
+                for layer in pkv.layers
+                if getattr(layer, "is_initialized", True) and hasattr(layer, "keys")
+            ]
+            logger.debug("capture_batch: transformers 5.x DynamicCache, %d layers", len(pkv_list))
+        elif hasattr(pkv, "to_legacy_cache"):
+            pkv_list = list(pkv.to_legacy_cache())
+            logger.debug("capture_batch: transformers 4.x (to_legacy_cache), %d layers", len(pkv_list))
+        elif hasattr(pkv, "key_cache"):
+            pkv_list = list(zip(pkv.key_cache, pkv.value_cache))
+            logger.debug("capture_batch: transformers 4.x (key_cache), %d layers", len(pkv_list))
+        else:
+            pkv_list = list(pkv)
+            logger.debug("capture_batch: legacy tuple cache, %d layers", len(pkv_list))
+
+        results = []
+        for batch_idx, seq_len in enumerate(lengths):
+            kv_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+            for layer_idx in layers:
+                if layer_idx >= len(pkv_list):
+                    logger.warning(
+                        "Layer %d out of range (cache has %d layers), skipping",
+                        layer_idx, len(pkv_list),
+                    )
+                    continue
+                # Slice batch item and strip padding: [:, :seq_len, :]
+                K = pkv_list[layer_idx][0][batch_idx, :, :seq_len, :]  # [kv_heads, seq_len, head_dim]
+                V = pkv_list[layer_idx][1][batch_idx, :, :seq_len, :]
+                kv_by_layer[layer_idx] = (K, V)
+
+            hidden_by_layer: dict[int, torch.Tensor] = {}
+            for layer_idx in layers:
+                hs_idx = layer_idx + 1  # hidden_states[0] is embedding layer
+                if hs_idx >= len(out.hidden_states):
+                    logger.warning(
+                        "Hidden state index %d out of range, skipping layer %d",
+                        hs_idx, layer_idx,
+                    )
+                    continue
+                hidden = out.hidden_states[hs_idx][batch_idx, :seq_len, :].float()  # [seq_len, d_model]
+                hidden_by_layer[layer_idx] = hidden
+
+            results.append((kv_by_layer, hidden_by_layer))
+
+        return results
 
     # ------------------------------------------------------------------
     # inject_and_generate()

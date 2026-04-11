@@ -54,11 +54,12 @@ class TestChunkTurn:
             assert len(chunk) > 0
 
     def test_respects_target_tokens(self, fake_tokenizer):
-        """With a tiny target, each sentence should be its own chunk."""
-        # Each word becomes one token in FakeTokenizer
-        text = "one two three. four five six. seven eight nine."
+        """With a tiny target, sentences exceeding target_tokens must not all merge."""
+        # Each sentence has 5 words (5 tokens in FakeTokenizer) which exceeds target_tokens=3.
+        # Sentences are long enough that spacy/regex both detect sentence boundaries.
+        text = "alpha beta gamma delta epsilon. zeta eta theta iota kappa. lambda mu nu xi omicron."
         chunks = chunk_turn(text, fake_tokenizer, target_tokens=3)
-        # Should produce at least 2 chunks since we have ~9 tokens total
+        # Each sentence is 5 tokens > target=3, so each is its own chunk
         assert len(chunks) >= 2
 
     def test_large_target_produces_single_chunk(self, fake_tokenizer):
@@ -74,3 +75,26 @@ class TestChunkTurn:
         chunks = chunk_turn(text, fake_tokenizer, target_tokens=5)
         combined_words = set(" ".join(chunks).replace(".", "").split())
         assert original_words <= combined_words, "Words lost during chunking"
+
+    def test_hard_max_respected(self, fake_tokenizer):
+        """Fix 8: No output chunk should exceed hard_max tokens.
+
+        FakeTokenizer assigns 1 token per word, so a 3049-word block
+        should be split into chunks of at most 400 tokens each.
+        """
+        # Build a single-sentence block of 3049 words (simulates a giant code block)
+        long_sentence = " ".join([f"word{i}" for i in range(3049)])
+        chunks = chunk_turn(long_sentence, fake_tokenizer, hard_max=400)
+        assert chunks, "Expected at least one chunk from a 3049-word input"
+        for chunk in chunks:
+            token_count = len(fake_tokenizer.encode(chunk))
+            assert token_count <= 400, (
+                f"Chunk has {token_count} tokens, exceeds hard_max=400: '{chunk[:80]}...'"
+            )
+
+    def test_hard_max_larger_than_target(self, fake_tokenizer):
+        """hard_max is an absolute ceiling; target_tokens is a soft goal below it."""
+        text = " ".join([f"w{i}" for i in range(500)])
+        chunks = chunk_turn(text, fake_tokenizer, target_tokens=100, hard_max=200)
+        for chunk in chunks:
+            assert len(fake_tokenizer.encode(chunk)) <= 200

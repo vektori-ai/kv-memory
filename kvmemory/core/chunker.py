@@ -73,6 +73,7 @@ def chunk_turn(
     tokenizer,
     target_tokens: int = 100,
     min_tokens: int = 20,
+    hard_max: int = 400,
 ) -> list[str]:
     """
     Split a conversation turn into semantic chunks.
@@ -81,14 +82,19 @@ def chunk_turn(
     target token count is exceeded, then starts a new chunk.
     Chunks below min_tokens are merged with the previous chunk.
 
+    Sentences longer than hard_max tokens are split into sub-chunks of
+    at most hard_max tokens before accumulation, so no output chunk
+    ever exceeds hard_max tokens.
+
     Args:
         text:          full turn text (prompt + response)
         tokenizer:     must have .encode(str) -> list[int]
         target_tokens: target chunk size in tokens (80-150 recommended)
         min_tokens:    minimum chunk size; smaller chunks are merged
+        hard_max:      absolute maximum tokens per output chunk (default 400)
 
     Returns:
-        list of text chunks, each approximately target_tokens long
+        list of text chunks, each at most hard_max tokens long
     """
     if not text or not text.strip():
         return []
@@ -101,16 +107,39 @@ def chunk_turn(
     current_sents: list[str] = []
     current_count: int = 0
 
+    def _flush():
+        nonlocal current_sents, current_count
+        if current_sents:
+            chunks.append(" ".join(current_sents))
+        current_sents = []
+        current_count = 0
+
     for sent in sentences:
-        n = len(tokenizer.encode(sent))
+        sent_ids = tokenizer.encode(sent)
+        n = len(sent_ids)
 
         if n == 0:
             continue
 
+        # Split oversized sentences into hard_max sub-chunks
+        if n > hard_max:
+            # Flush any accumulated content first
+            if current_sents:
+                _flush()
+            for sub_start in range(0, n, hard_max):
+                sub_ids = sent_ids[sub_start: sub_start + hard_max]
+                sub_text = tokenizer.decode(sub_ids, skip_special_tokens=True)
+                # Process sub-text through accumulation logic as a separate "sentence"
+                sub_n = len(sub_ids)
+                if current_count + sub_n > target_tokens and current_sents:
+                    _flush()
+                current_sents.append(sub_text)
+                current_count += sub_n
+            continue
+
         # If adding this sentence would exceed target and we have content, flush
         if current_count + n > target_tokens and current_sents:
-            chunk_text = " ".join(current_sents)
-            chunks.append(chunk_text)
+            _flush()
             current_sents = [sent]
             current_count = n
         else:
@@ -120,9 +149,13 @@ def chunk_turn(
     # Flush remainder
     if current_sents:
         remainder = " ".join(current_sents)
-        # Merge tiny trailing chunk into previous if below min_tokens
+        # Merge tiny trailing chunk into previous if below min_tokens and within hard_max
         if current_count < min_tokens and chunks:
-            chunks[-1] = chunks[-1] + " " + remainder
+            merged = chunks[-1] + " " + remainder
+            if len(tokenizer.encode(merged)) <= hard_max:
+                chunks[-1] = merged
+            else:
+                chunks.append(remainder)
         else:
             chunks.append(remainder)
 
