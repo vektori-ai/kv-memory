@@ -340,8 +340,12 @@ async def run_write_pipeline(
 
             # Step 5: Compute normalized retrieval vectors
             hidden_vecs: dict[int, np.ndarray] = {}
-            for layer, hidden in hidden_by_layer.items():
-                hidden_vecs[layer] = compute_retrieval_vec(hidden, len(chunk_tokens))
+            for layer in config.retrieval_layers:
+                if layer in hidden_by_layer:
+                    hidden_vecs[layer] = compute_retrieval_vec(
+                        hidden_by_layer[layer],
+                        len(chunk_tokens),
+                    )
 
             # Step 6: Dedup check
             skip_as_dup = False

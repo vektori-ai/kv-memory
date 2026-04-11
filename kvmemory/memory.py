@@ -80,6 +80,8 @@ class KVMemory:
         self.adapter = adapter
         self.config = config
         self.observer = observer
+        if not self.config.store_layers:
+            self.config.store_layers = list(range(adapter.num_layers))
 
         self.vector_db = VectorDB(url=config.qdrant_url, port=config.qdrant_port)
         self.kv_store = KVStore(blob_store_path=config.blob_store_path)
