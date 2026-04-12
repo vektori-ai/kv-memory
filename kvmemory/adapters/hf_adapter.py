@@ -29,6 +29,55 @@ from ..storage.schema import KVBlock, GenerationOutput
 logger = logging.getLogger(__name__)
 
 
+def _apply_entropy_weights(
+    hidden: torch.Tensor,
+    attentions,
+    layer_idx: int,
+    seq_len: int,
+    batch_idx: int = 0,
+) -> torch.Tensor:
+    """
+    Pre-scale hidden states by attention-entropy salience weights so that
+    compute_retrieval_vec's mean pooling produces an entropy-weighted mean.
+
+    Salience = softmax(-entropy) over token positions.
+    Low-entropy tokens have focused attention → they are content words → higher weight.
+
+    Pre-scaling trick:
+        hidden_scaled[i] = hidden[i] * weight[i] * seq_len
+        mean(hidden_scaled) = sum(weight[i] * hidden[i])   ← weighted mean ✓
+
+    Falls back to unweighted hidden states if attentions are unavailable
+    (some models set output_attentions=True but return None for certain layers).
+    """
+    if attentions is None or layer_idx >= len(attentions) or attentions[layer_idx] is None:
+        return hidden  # graceful fallback: unweighted
+
+    try:
+        attn = attentions[layer_idx]          # [batch, heads, seq, seq]
+        attn_item = attn[batch_idx, :, :seq_len, :seq_len].float()  # [heads, seq, seq]
+
+        # Mean attention distribution per query token across heads
+        mean_attn = attn_item.mean(dim=0)     # [seq, seq]
+
+        # Renormalize rows (numerical safety — softmax rows should already sum to 1)
+        row_sums = mean_attn.sum(dim=-1, keepdim=True).clamp(min=1e-9)
+        mean_attn = mean_attn / row_sums
+
+        # Row entropy: how focused is each token's attention?  [seq]
+        entropy = -(mean_attn * torch.log(mean_attn.clamp(min=1e-9))).sum(dim=-1)
+
+        # Salience: low entropy = focused = important token
+        salience = torch.softmax(-entropy, dim=0)  # [seq], sums to 1
+
+        # Pre-scale so downstream mean pooling yields the weighted mean
+        return hidden * (salience.unsqueeze(-1) * seq_len)
+
+    except Exception as e:
+        logger.debug("Entropy weighting failed for layer %d, falling back: %s", layer_idx, e)
+        return hidden
+
+
 class HFAdapter(BaseAdapter):
     """
     HuggingFace adapter for capture and KV-injected generation.
@@ -111,7 +160,7 @@ class HFAdapter(BaseAdapter):
                 input_ids=input_ids,
                 attention_mask=attn_mask,
                 output_hidden_states=True,
-                output_attentions=False,
+                output_attentions=True,   # needed for entropy-weighted pooling
                 use_cache=True,
             )
 
@@ -152,7 +201,9 @@ class HFAdapter(BaseAdapter):
                 )
                 continue
             hidden = out.hidden_states[hs_idx][0, :seq_len, :].float()  # [seq_len, d_model]
-            hidden_by_layer[layer_idx] = hidden
+            hidden_by_layer[layer_idx] = _apply_entropy_weights(
+                hidden, out.attentions, layer_idx, seq_len
+            )
 
         return kv_by_layer, hidden_by_layer
 
@@ -203,7 +254,7 @@ class HFAdapter(BaseAdapter):
                 input_ids=input_ids,
                 attention_mask=attn_mask,
                 output_hidden_states=True,
-                output_attentions=False,
+                output_attentions=True,   # needed for entropy-weighted pooling
                 use_cache=True,
             )
 
@@ -252,7 +303,9 @@ class HFAdapter(BaseAdapter):
                     )
                     continue
                 hidden = out.hidden_states[hs_idx][batch_idx, :seq_len, :].float()  # [seq_len, d_model]
-                hidden_by_layer[layer_idx] = hidden
+                hidden_by_layer[layer_idx] = _apply_entropy_weights(
+                    hidden, out.attentions, layer_idx, seq_len, batch_idx=batch_idx
+                )
 
             results.append((kv_by_layer, hidden_by_layer))
 
@@ -449,6 +502,20 @@ class HFAdapter(BaseAdapter):
         current_pkv = fwd.past_key_values
         next_pos = position_offset + seq_len
 
+        # After the prefill, the KV cache has grown by seq_len.
+        # _InjectedCache.get_seq_length() was set to position_offset (the initial
+        # injected past), but the model uses get_seq_length() to compute the causal
+        # mask offset for each decode step. If it stays at position_offset, the
+        # causal mask only allows attending to positions 0..position_offset, masking
+        # out the query tokens that were just processed in the prefill — so decode
+        # tokens can't attend to the full history and generate garbage.
+        # Fix: keep _total_past in sync with the actual cache length after each step.
+        def _sync_cache_length(pkv, length: int) -> None:
+            if hasattr(pkv, "_total_past"):
+                pkv._total_past = length
+
+        _sync_cache_length(current_pkv, next_pos)
+
         # Autoregressive decode
         for _ in range(max_new_tokens):
             logits = fwd.logits[0, -1, :]  # [vocab]
@@ -480,6 +547,7 @@ class HFAdapter(BaseAdapter):
                 )
             current_pkv = fwd.past_key_values
             next_pos += 1
+            _sync_cache_length(current_pkv, next_pos)
 
         text = self._tokenizer.decode(generated, skip_special_tokens=True)
         return GenerationOutput(sequences=[generated], text=text)

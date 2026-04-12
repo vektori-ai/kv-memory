@@ -135,6 +135,7 @@ def stage2_rerank_mmr(
     vector_db: "VectorDB",
     token_budget: int,
     mmr_lambda: float = 0.7,
+    min_relevance: float = 0.0,
 ) -> list[str]:
     """
     Stage 2: MMR rerank with token budget enforcement.
@@ -206,6 +207,14 @@ def stage2_rerank_mmr(
                 best = cand
 
         if best is None:
+            break
+
+        # Drop blocks below minimum relevance — prevents injecting irrelevant context
+        if min_relevance > 0.0 and relevance(best) < min_relevance:
+            logger.debug(
+                "MMR: stopping — best remaining block relevance %.3f < min_relevance %.3f",
+                relevance(best), min_relevance,
+            )
             break
 
         n_tokens = (best["payload"] or {}).get("token_count", 0)

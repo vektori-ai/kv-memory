@@ -80,6 +80,11 @@ class KVMemory:
         self.adapter = adapter
         self.config = config
         self.observer = observer
+        # Auto-compute retrieval_layers as 25/50/75% of model depth if not set
+        if not self.config.retrieval_layers:
+            n = adapter.num_layers
+            self.config.retrieval_layers = [n // 4, n // 2, (3 * n) // 4]
+
         if not self.config.store_layers:
             self.config.store_layers = list(range(adapter.num_layers))
 
@@ -172,6 +177,7 @@ class KVMemory:
             config=self.config,
             vector_db=self.vector_db,
             token_budget=self.config.token_budget,
+            min_relevance=self.config.min_relevance,
         )
         stage2_ms = (time.perf_counter() - stage2_start) * 1000
         if observer:

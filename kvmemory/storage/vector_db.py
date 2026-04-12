@@ -41,7 +41,10 @@ class VectorDB:
     """
 
     def __init__(self, url: str = "localhost", port: int = 6333) -> None:
-        self.client = QdrantClient(host=url, port=port)
+        if url == ":memory:":
+            self.client = QdrantClient(":memory:")
+        else:
+            self.client = QdrantClient(host=url, port=port)
 
     # ------------------------------------------------------------------
     # Collection management
