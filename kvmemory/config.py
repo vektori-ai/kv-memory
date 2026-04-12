@@ -36,6 +36,12 @@ class KVMemoryConfig:
     # Runtime
     async_write: bool = True
 
+    # Retrieval vector source:
+    #   "k_vectors"     — use attention K tensors (num_kv_heads * head_dim dims).
+    #                     More discriminative for short chunks; fixes retrieval collapse.
+    #   "hidden_states" — legacy: use mean-pooled hidden states (d_model dims).
+    retrieval_vec_source: str = "k_vectors"
+
     # Infrastructure
     qdrant_url: str = "localhost"
     qdrant_port: int = 6333

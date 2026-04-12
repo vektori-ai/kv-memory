@@ -117,6 +117,14 @@ class HFAdapter(BaseAdapter):
         return self._num_heads
 
     @property
+    def num_kv_heads(self) -> int:
+        return self._num_kv_heads
+
+    @property
+    def head_dim(self) -> int:
+        return self._d_model // self._num_heads
+
+    @property
     def tokenizer(self):
         return self._tokenizer
 

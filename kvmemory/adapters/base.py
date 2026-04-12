@@ -106,6 +106,16 @@ class BaseAdapter(ABC):
         ...
 
     @property
+    def num_kv_heads(self) -> int:
+        """Number of KV heads (may differ from num_heads for GQA models)."""
+        return self.num_heads  # fallback: assume no GQA
+
+    @property
+    def head_dim(self) -> int:
+        """Attention head dimension (d_model // num_heads)."""
+        return self.d_model // self.num_heads
+
+    @property
     @abstractmethod
     def tokenizer(self):
         """Tokenizer instance (must have encode / decode methods)."""

@@ -78,6 +78,10 @@ class BEAMResult:
     stage2_ms: float = 0.0   # MMR rerank
     fetch_ms: float = 0.0    # blob store fetch
     generate_ms: float = 0.0 # inject + generate
+    # HITL fields — populated by KV Memory eval, empty for baselines
+    question: str = ""
+    context: str = ""
+    retrieved_chunks: list = field(default_factory=list)  # chunk texts that were injected
 
 
 @dataclass
@@ -625,6 +629,9 @@ async def run_kv_memory_eval(
             stage2_ms=(t2 - t1) * 1000,
             fetch_ms=(t3 - t2) * 1000,
             generate_ms=(t4 - t3) * 1000,
+            question=q.question,
+            context=q.context,
+            retrieved_chunks=[b.chunk_text for b in blocks],
         ))
 
         logger.debug(
@@ -1353,6 +1360,28 @@ def _save_results(path, kv_results, rag_results, sw_results,
                 "results": [dataclasses.asdict(r) for r in sw_results],
             },
         }, f, indent=2)
+
+    # Also write a clean HITL review file: one entry per question, easy to read
+    hitl_path = path.replace(".json", "_hitl.json")
+    rag_by_id = {r.question_id: r for r in rag_results}
+    hitl = []
+    for r in kv_results:
+        rag = rag_by_id.get(r.question_id)
+        hitl.append({
+            "id": r.question_id,
+            "type": r.question_type,
+            "question": r.question,
+            "context": r.context,
+            "gold": r.gold_answer,
+            "kv_pred": r.predicted_answer,
+            "kv_pass": r.correct,
+            "rag_pred": rag.predicted_answer if rag else None,
+            "rag_pass": rag.correct if rag else None,
+            "retrieved_chunks": r.retrieved_chunks,
+        })
+    with open(hitl_path, "w") as f:
+        json.dump(hitl, f, indent=2)
+    logger.info("HITL review file saved to %s", hitl_path)
 
 
 if __name__ == "__main__":

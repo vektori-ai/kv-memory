@@ -419,7 +419,7 @@ def run_diagnostic(model_key: str = "0.5b"):
 # -----------------------------------------------------------------------
 
 @app.function(gpu="A10G", timeout=1800)
-def run_beam(n: int = 20, model_key: str = "0.5b"):
+def run_beam(n: int = 20, model_key: str = "0.5b", text_rerank: bool = False):
     import sys, asyncio
     sys.path.insert(0, "/root/kv-memory")
 
@@ -439,6 +439,7 @@ def run_beam(n: int = 20, model_key: str = "0.5b"):
     from kvmemory.core.retrieval import stage1_coarse, stage2_rerank_mmr
     from kvmemory.core.injector import inject_and_generate
     from kvmemory.memory import _build_session_filter
+    import json as _json
 
     dataset = create_synthetic_dataset(n)
     print(f"Synthetic dataset: {len(dataset)} questions\n")
@@ -545,12 +546,19 @@ def run_beam(n: int = 20, model_key: str = "0.5b"):
             session_filter=session_filter,
         )
 
-        # Both 0.5B and 7B have retrieval collapse: all cosine similarities are
-        # within 0.0002 of each other regardless of content. Text reranking on
-        # chunk_text payload is far more reliable than margin-~0 vector ranking.
-        # final_top_k caps how many blocks we take (1 for 0.5B, 3 for 7B).
-        reranked_ids = _text_rerank(candidate_ids, q.question)
-        final_ids = reranked_ids[:memory.config.final_top_k] if reranked_ids else []
+        if text_rerank:
+            # Legacy BM25 text reranking (workaround for hidden-state retrieval collapse)
+            reranked_ids = _text_rerank(candidate_ids, q.question)
+            final_ids = reranked_ids[:memory.config.final_top_k] if reranked_ids else []
+        else:
+            # K-vector retrieval: use MMR reranking on cosine similarity scores
+            final_ids = stage2_rerank_mmr(
+                candidate_ids=candidate_ids,
+                query_vecs=query_vecs,
+                config=memory.config,
+                vector_db=memory.vector_db,
+                token_budget=memory.config.token_budget,
+            )
 
         blocks = memory.kv_store.fetch(final_ids, model_id=memory.config.model_id)
 
@@ -611,6 +619,9 @@ def run_beam(n: int = 20, model_key: str = "0.5b"):
             f1_score=f1,
             prefill_tokens=len(gen_tokens),
             latency_ms=gen_ms,
+            question=q.question,
+            context=q.context,
+            retrieved_chunks=[b.chunk_text for b in blocks],
         )
 
     async def _run():
@@ -630,6 +641,24 @@ def run_beam(n: int = 20, model_key: str = "0.5b"):
 
     print_comparison(kv_metrics, rag_metrics, None)
 
+    # Build HITL data for local review
+    rag_by_id = {r.question_id: r for r in rag_results}
+    hitl = []
+    for r in kv_results:
+        rag = rag_by_id.get(r.question_id)
+        hitl.append({
+            "id": r.question_id,
+            "type": r.question_type,
+            "question": r.question,
+            "context": r.context,
+            "gold": r.gold_answer,
+            "kv_pred": r.predicted_answer,
+            "kv_pass": r.correct,
+            "rag_pred": rag.predicted_answer if rag else None,
+            "rag_pass": rag.correct if rag else None,
+            "retrieved_chunks": r.retrieved_chunks,
+        })
+
     return {
         "kv_f1":  kv_metrics.overall_f1,
         "rag_f1": rag_metrics.overall_f1,
@@ -638,17 +667,23 @@ def run_beam(n: int = 20, model_key: str = "0.5b"):
         "token_savings_pct": round(
             100 * (1 - kv_metrics.avg_prefill_tokens / max(rag_metrics.avg_prefill_tokens, 1)), 1
         ),
+        "hitl": hitl,
     }
 
 
 @app.local_entrypoint()
-def main(n: int = 20, diag: bool = False, model: str = "0.5b"):
+def main(n: int = 20, diag: bool = False, model: str = "0.5b",
+         text_rerank: bool = False, out: str = ""):
     """
-    --model 0.5b   Qwen2.5-0.5B base on A10G  (default)
-    --model 7b     Qwen2.5-7B-Instruct on A10G
-    --diag         Run retrieval + injection diagnostic instead of full BEAM
-    --n N          Number of synthetic questions (default 20)
+    --model 0.5b        Qwen2.5-0.5B base on A10G  (default)
+    --model 7b          Qwen2.5-7B-Instruct on A10G
+    --diag              Retrieval + injection diagnostic (shows similarity scores)
+    --n N               Number of synthetic questions (default 20)
+    --text-rerank       Use BM25 text reranking instead of K-vector MMR
+    --out results.json  Save HITL JSON to this file
     """
+    import json
+
     if model not in MODELS:
         print(f"Unknown model '{model}'. Choose from: {list(MODELS.keys())}")
         return
@@ -662,8 +697,11 @@ def main(n: int = 20, diag: bool = False, model: str = "0.5b"):
         print(f"Oracle hits:    {result['oracle_hits']}/{result['n_facts']}")
         return
 
-    print(f"\nRunning BEAM synthetic (n={n}) with {MODELS[model]['id']} on {gpu}...\n")
-    result = run_beam.remote(n=n, model_key=model)
+    retrieval_mode = "text-rerank (BM25)" if text_rerank else "K-vector MMR"
+    print(f"\nRunning BEAM synthetic (n={n}) with {MODELS[model]['id']} on {gpu}")
+    print(f"Retrieval: {retrieval_mode}\n")
+    result = run_beam.remote(n=n, model_key=model, text_rerank=text_rerank)
+
     print(f"\n{'='*50}")
     print(f"KV Memory F1:  {result['kv_f1']:.3f}")
     print(f"RAG F1:        {result['rag_f1']:.3f}")
@@ -672,3 +710,8 @@ def main(n: int = 20, diag: bool = False, model: str = "0.5b"):
     print(f"KV tokens/q:   {result['kv_tokens']:.0f}")
     print(f"RAG tokens/q:  {result['rag_tokens']:.0f}")
     print(f"Token savings: {result['token_savings_pct']}%")
+
+    hitl_path = out or f"hitl_{model}.json"
+    with open(hitl_path, "w") as f:
+        json.dump(result["hitl"], f, indent=2)
+    print(f"\nHITL results saved to {hitl_path}")

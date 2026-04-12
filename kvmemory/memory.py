@@ -91,11 +91,20 @@ class KVMemory:
         self.vector_db = VectorDB(url=config.qdrant_url, port=config.qdrant_port)
         self.kv_store = KVStore(blob_store_path=config.blob_store_path)
 
-        # Ensure Qdrant collection exists
+        # Ensure Qdrant collection exists.
+        # vec_dim depends on retrieval_vec_source:
+        #   k_vectors (default): num_kv_heads * head_dim — attention key subspace
+        #   hidden_states:       d_model — raw hidden state dimension
+        use_k_vecs = getattr(config, "retrieval_vec_source", "k_vectors") == "k_vectors"
+        vec_dim = (
+            adapter.num_kv_heads * adapter.head_dim
+            if use_k_vecs
+            else adapter.d_model
+        )
         self.vector_db.ensure_collection(
             model_id=config.model_id,
             retrieval_layers=config.retrieval_layers,
-            d_model=adapter.d_model,
+            vec_dim=vec_dim,
         )
 
         # Write queue: wraps the pipeline with references to stores

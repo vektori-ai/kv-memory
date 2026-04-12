@@ -31,10 +31,11 @@ class TestStoreLayersDefault:
 
         assert memory.config.store_layers == list(range(mock_adapter.num_layers))
         assert memory.config.retrieval_layers == [1, 3]
+        expected_vec_dim = mock_adapter.num_kv_heads * mock_adapter.head_dim
         vector_db_cls.return_value.ensure_collection.assert_called_once_with(
             model_id="test-model",
             retrieval_layers=[1, 3],
-            d_model=mock_adapter.d_model,
+            vec_dim=expected_vec_dim,
         )
 
     def test_explicit_store_layers_are_preserved(self, mock_adapter, monkeypatch):

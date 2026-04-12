@@ -54,13 +54,18 @@ class VectorDB:
         self,
         model_id: str,
         retrieval_layers: list[int],
-        d_model: int,
+        vec_dim: int,
+        d_model: int = 0,  # deprecated, ignored — kept for backwards compat
     ) -> None:
         """
         Create Qdrant collection if it doesn't exist.
 
         Uses Distance.COSINE because vectors are L2-normalized at write time.
         Qdrant uses dot product internally for unit vectors — fast and correct.
+
+        vec_dim: dimension of stored retrieval vectors.
+            - hidden-state mode: d_model (e.g. 5120 for Qwen3-14B)
+            - k-vector mode:     num_kv_heads * head_dim (e.g. 8*128=1024)
         """
         collection_name = self._collection_name(model_id)
         existing = [c.name for c in self.client.get_collections().collections]
@@ -70,7 +75,7 @@ class VectorDB:
             return
 
         vectors_config = {
-            f"layer_{layer}": VectorParams(size=d_model, distance=Distance.COSINE)
+            f"layer_{layer}": VectorParams(size=vec_dim, distance=Distance.COSINE)
             for layer in retrieval_layers
         }
         self.client.create_collection(
@@ -78,10 +83,10 @@ class VectorDB:
             vectors_config=vectors_config,
         )
         logger.info(
-            "Created Qdrant collection %s with layers %s, d_model=%d",
+            "Created Qdrant collection %s with layers %s, vec_dim=%d",
             collection_name,
             retrieval_layers,
-            d_model,
+            vec_dim,
         )
 
     def delete_collection(self, model_id: str) -> None:
