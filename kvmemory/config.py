@@ -15,9 +15,9 @@ class KVMemoryConfig:
     model_id: str
 
     # Which layers to extract hidden states + KV tensors from.
-    # Target 25%, 50%, 75% of model depth.
-    # e.g. [8, 16, 24] for a 32-layer model.
-    retrieval_layers: list[int] = field(default_factory=lambda: [8, 16, 24])
+    # Empty list = auto-compute as [25%, 50%, 75%] of model depth at init time.
+    # Override only if you want specific layers: e.g. [8, 16, 24] for a 32-layer model.
+    retrieval_layers: list[int] = field(default_factory=list)
     store_layers: list[int] = field(default_factory=list)   # empty means auto: all model layers
 
     # Retrieval budget
@@ -28,12 +28,19 @@ class KVMemoryConfig:
     # Quality gates
     importance_threshold: float = 0.3   # chunks below this score are never stored
     dedup_threshold: float = 0.95       # skip write if similarity > this to existing block
+    min_relevance: float = 0.0          # stage2: don't inject blocks below this cosine sim
 
     # Capture batch size — lower = less GPU memory pressure per write call
     capture_batch_size: int = 8
 
     # Runtime
     async_write: bool = True
+
+    # Retrieval vector source:
+    #   "k_vectors"     — use attention K tensors (num_kv_heads * head_dim dims).
+    #                     More discriminative for short chunks; fixes retrieval collapse.
+    #   "hidden_states" — legacy: use mean-pooled hidden states (d_model dims).
+    retrieval_vec_source: str = "k_vectors"
 
     # Infrastructure
     qdrant_url: str = "localhost"

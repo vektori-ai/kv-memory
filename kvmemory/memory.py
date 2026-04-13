@@ -80,17 +80,31 @@ class KVMemory:
         self.adapter = adapter
         self.config = config
         self.observer = observer
+        # Auto-compute retrieval_layers as 25/50/75% of model depth if not set
+        if not self.config.retrieval_layers:
+            n = adapter.num_layers
+            self.config.retrieval_layers = [n // 4, n // 2, (3 * n) // 4]
+
         if not self.config.store_layers:
             self.config.store_layers = list(range(adapter.num_layers))
 
         self.vector_db = VectorDB(url=config.qdrant_url, port=config.qdrant_port)
         self.kv_store = KVStore(blob_store_path=config.blob_store_path)
 
-        # Ensure Qdrant collection exists
+        # Ensure Qdrant collection exists.
+        # vec_dim depends on retrieval_vec_source:
+        #   k_vectors (default): num_kv_heads * head_dim — attention key subspace
+        #   hidden_states:       d_model — raw hidden state dimension
+        use_k_vecs = getattr(config, "retrieval_vec_source", "k_vectors") == "k_vectors"
+        vec_dim = (
+            adapter.num_kv_heads * adapter.head_dim
+            if use_k_vecs
+            else adapter.d_model
+        )
         self.vector_db.ensure_collection(
             model_id=config.model_id,
             retrieval_layers=config.retrieval_layers,
-            d_model=adapter.d_model,
+            vec_dim=vec_dim,
         )
 
         # Write queue: wraps the pipeline with references to stores
@@ -172,6 +186,7 @@ class KVMemory:
             config=self.config,
             vector_db=self.vector_db,
             token_budget=self.config.token_budget,
+            min_relevance=self.config.min_relevance,
         )
         stage2_ms = (time.perf_counter() - stage2_start) * 1000
         if observer:

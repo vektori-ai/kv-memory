@@ -68,6 +68,29 @@ def compute_retrieval_vec(
     return pooled.cpu().numpy().astype(np.float32)
 
 
+def compute_k_vec(K: torch.Tensor) -> np.ndarray:
+    """
+    Compute a retrieval vector from attention K tensors (Option B).
+
+    Uses the model's attention keys instead of hidden states — W_K projects
+    into the attention subspace, which is more content-discriminative than
+    raw hidden states for short chunks.
+
+    Args:
+        K: [kv_heads, seq, head_dim] float tensor
+
+    Returns:
+        [kv_heads * head_dim] float32 numpy array, L2-normalized
+    """
+    if K.dim() != 3:
+        raise ValueError(f"Expected [kv_heads, seq, head_dim], got {K.shape}")
+
+    pooled = K.float().mean(dim=1)      # [kv_heads, head_dim] — mean over seq
+    flat = pooled.flatten()              # [kv_heads * head_dim]
+    normed = F.normalize(flat, dim=0)
+    return normed.cpu().numpy().astype(np.float32)
+
+
 def compute_query_vecs(
     tokens: list[int],
     adapter: "BaseAdapter",
@@ -78,16 +101,29 @@ def compute_query_vecs(
 
     Runs a partial forward pass to max(retrieval_layers).
     Returns one normalized vector per retrieval layer.
+
+    Uses K vectors (attention keys) when retrieval_vec_source == "k_vectors"
+    (default), otherwise falls back to hidden states. K vectors are projected
+    into the attention subspace via W_K, giving more discriminative signal
+    for short texts than raw hidden states.
     """
-    _, hidden_by_layer = adapter.capture(
+    kv_by_layer, hidden_by_layer = adapter.capture(
         tokens=tokens,
         text="",
         layers=config.retrieval_layers,
     )
-    return {
-        layer: compute_retrieval_vec(hidden, len(tokens))
-        for layer, hidden in hidden_by_layer.items()
-    }
+
+    if getattr(config, "retrieval_vec_source", "k_vectors") == "k_vectors":
+        return {
+            layer: compute_k_vec(K)
+            for layer, (K, _) in kv_by_layer.items()
+            if layer in config.retrieval_layers
+        }
+    else:
+        return {
+            layer: compute_retrieval_vec(hidden, len(tokens))
+            for layer, hidden in hidden_by_layer.items()
+        }
 
 
 # ------------------------------------------------------------------
@@ -135,6 +171,7 @@ def stage2_rerank_mmr(
     vector_db: "VectorDB",
     token_budget: int,
     mmr_lambda: float = 0.7,
+    min_relevance: float = 0.0,
 ) -> list[str]:
     """
     Stage 2: MMR rerank with token budget enforcement.
@@ -206,6 +243,14 @@ def stage2_rerank_mmr(
                 best = cand
 
         if best is None:
+            break
+
+        # Drop blocks below minimum relevance — prevents injecting irrelevant context
+        if min_relevance > 0.0 and relevance(best) < min_relevance:
+            logger.debug(
+                "MMR: stopping — best remaining block relevance %.3f < min_relevance %.3f",
+                relevance(best), min_relevance,
+            )
             break
 
         n_tokens = (best["payload"] or {}).get("token_count", 0)

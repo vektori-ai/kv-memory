@@ -33,7 +33,7 @@ from ..core.importance import (
     compute_chunk_loss,
     score_importance,
 )
-from ..core.retrieval import compute_retrieval_vec
+from ..core.retrieval import compute_retrieval_vec, compute_k_vec
 from ..observability import RunObserver
 from ..storage.kv_store import KVStore
 from ..storage.schema import KVBlock
@@ -339,9 +339,16 @@ async def run_write_pipeline(
             del capture_results[orig_index]
 
             # Step 5: Compute normalized retrieval vectors
+            # Option B: use attention K vectors (more discriminative than hidden states
+            # for short chunks — W_K projects into content-specific attention subspace).
+            # Falls back to hidden states if retrieval_vec_source != "k_vectors".
             hidden_vecs: dict[int, np.ndarray] = {}
+            use_k_vecs = getattr(config, "retrieval_vec_source", "k_vectors") == "k_vectors"
             for layer in config.retrieval_layers:
-                if layer in hidden_by_layer:
+                if use_k_vecs and layer in kv_by_layer_float:
+                    K, _ = kv_by_layer_float[layer]
+                    hidden_vecs[layer] = compute_k_vec(K)
+                elif layer in hidden_by_layer:
                     hidden_vecs[layer] = compute_retrieval_vec(
                         hidden_by_layer[layer],
                         len(chunk_tokens),

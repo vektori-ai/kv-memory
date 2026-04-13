@@ -168,3 +168,72 @@ class TestImportanceFilter:
         tracker.update(10.0)
         tracker.reset()
         assert tracker.value == pytest.approx(2.0)
+
+
+class TestPrefillReduction:
+    """
+    Test 2 from plan.md: verify injected KV tokens do NOT hit prefill.
+
+    When KV blocks are injected via past_key_values, the model's forward
+    call should receive only the query tokens as input_ids — not the stored
+    context tokens. The injected tokens are already materialised as KV and
+    bypass the prefill computation entirely.
+    """
+
+    def test_prefill_only_receives_query_tokens(self, mock_adapter, sample_kv_block):
+        """
+        Injected block tokens must NOT appear in the input_ids sent to the model.
+        Only current_tokens hit prefill.
+        """
+        received_input_ids = []
+
+        original_inject = mock_adapter.inject_and_generate
+
+        def capturing_inject(blocks, tokens, kwargs):
+            # Record what tokens were passed as the "current" query
+            received_input_ids.extend(tokens)
+            return original_inject(blocks, tokens, kwargs)
+
+        mock_adapter.inject_and_generate = capturing_inject
+
+        query = "What is the capital of France?"
+        query_tokens = mock_adapter.tokenizer.encode(query)
+        stored_token_count = sample_kv_block.token_count
+
+        inject_and_generate(mock_adapter, [sample_kv_block], query_tokens, {})
+
+        # The adapter must receive exactly the query tokens, not query + stored tokens
+        assert len(received_input_ids) == len(query_tokens), (
+            f"Prefill received {len(received_input_ids)} tokens but query is only "
+            f"{len(query_tokens)} tokens. Stored block has {stored_token_count} tokens "
+            "that should be injected via past_key_values, not re-prefilled."
+        )
+        assert received_input_ids == query_tokens, (
+            "input_ids passed to adapter do not match query tokens exactly."
+        )
+
+    def test_prefill_count_less_than_total_context(self, mock_adapter, sample_kv_block):
+        """
+        Total context = query + stored. Prefill must be strictly less than total.
+        This is the core cost saving claim of the system.
+        """
+        received_input_ids = []
+        original_inject = mock_adapter.inject_and_generate
+
+        def capturing_inject(blocks, tokens, kwargs):
+            received_input_ids.extend(tokens)
+            return original_inject(blocks, tokens, kwargs)
+
+        mock_adapter.inject_and_generate = capturing_inject
+
+        query_tokens = mock_adapter.tokenizer.encode("test query for prefill check")
+        inject_and_generate(mock_adapter, [sample_kv_block], query_tokens, {})
+
+        prefill_count = len(received_input_ids)
+        total_context = len(query_tokens) + sample_kv_block.token_count
+
+        assert prefill_count < total_context, (
+            f"Prefill count ({prefill_count}) should be less than total context "
+            f"({total_context} = {len(query_tokens)} query + {sample_kv_block.token_count} stored). "
+            "KV injection is supposed to skip prefill for stored tokens."
+        )

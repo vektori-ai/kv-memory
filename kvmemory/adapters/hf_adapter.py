@@ -29,6 +29,55 @@ from ..storage.schema import KVBlock, GenerationOutput
 logger = logging.getLogger(__name__)
 
 
+def _apply_entropy_weights(
+    hidden: torch.Tensor,
+    attentions,
+    layer_idx: int,
+    seq_len: int,
+    batch_idx: int = 0,
+) -> torch.Tensor:
+    """
+    Pre-scale hidden states by attention-entropy salience weights so that
+    compute_retrieval_vec's mean pooling produces an entropy-weighted mean.
+
+    Salience = softmax(-entropy) over token positions.
+    Low-entropy tokens have focused attention → they are content words → higher weight.
+
+    Pre-scaling trick:
+        hidden_scaled[i] = hidden[i] * weight[i] * seq_len
+        mean(hidden_scaled) = sum(weight[i] * hidden[i])   ← weighted mean ✓
+
+    Falls back to unweighted hidden states if attentions are unavailable
+    (some models set output_attentions=True but return None for certain layers).
+    """
+    if attentions is None or layer_idx >= len(attentions) or attentions[layer_idx] is None:
+        return hidden  # graceful fallback: unweighted
+
+    try:
+        attn = attentions[layer_idx]          # [batch, heads, seq, seq]
+        attn_item = attn[batch_idx, :, :seq_len, :seq_len].float()  # [heads, seq, seq]
+
+        # Mean attention distribution per query token across heads
+        mean_attn = attn_item.mean(dim=0)     # [seq, seq]
+
+        # Renormalize rows (numerical safety — softmax rows should already sum to 1)
+        row_sums = mean_attn.sum(dim=-1, keepdim=True).clamp(min=1e-9)
+        mean_attn = mean_attn / row_sums
+
+        # Row entropy: how focused is each token's attention?  [seq]
+        entropy = -(mean_attn * torch.log(mean_attn.clamp(min=1e-9))).sum(dim=-1)
+
+        # Salience: low entropy = focused = important token
+        salience = torch.softmax(-entropy, dim=0)  # [seq], sums to 1
+
+        # Pre-scale so downstream mean pooling yields the weighted mean
+        return hidden * (salience.unsqueeze(-1) * seq_len)
+
+    except Exception as e:
+        logger.debug("Entropy weighting failed for layer %d, falling back: %s", layer_idx, e)
+        return hidden
+
+
 class HFAdapter(BaseAdapter):
     """
     HuggingFace adapter for capture and KV-injected generation.
@@ -66,6 +115,14 @@ class HFAdapter(BaseAdapter):
     @property
     def num_heads(self) -> int:
         return self._num_heads
+
+    @property
+    def num_kv_heads(self) -> int:
+        return self._num_kv_heads
+
+    @property
+    def head_dim(self) -> int:
+        return self._d_model // self._num_heads
 
     @property
     def tokenizer(self):
@@ -111,7 +168,7 @@ class HFAdapter(BaseAdapter):
                 input_ids=input_ids,
                 attention_mask=attn_mask,
                 output_hidden_states=True,
-                output_attentions=False,
+                output_attentions=True,   # needed for entropy-weighted pooling
                 use_cache=True,
             )
 
@@ -152,7 +209,9 @@ class HFAdapter(BaseAdapter):
                 )
                 continue
             hidden = out.hidden_states[hs_idx][0, :seq_len, :].float()  # [seq_len, d_model]
-            hidden_by_layer[layer_idx] = hidden
+            hidden_by_layer[layer_idx] = _apply_entropy_weights(
+                hidden, out.attentions, layer_idx, seq_len
+            )
 
         return kv_by_layer, hidden_by_layer
 
@@ -203,7 +262,7 @@ class HFAdapter(BaseAdapter):
                 input_ids=input_ids,
                 attention_mask=attn_mask,
                 output_hidden_states=True,
-                output_attentions=False,
+                output_attentions=True,   # needed for entropy-weighted pooling
                 use_cache=True,
             )
 
@@ -252,7 +311,9 @@ class HFAdapter(BaseAdapter):
                     )
                     continue
                 hidden = out.hidden_states[hs_idx][batch_idx, :seq_len, :].float()  # [seq_len, d_model]
-                hidden_by_layer[layer_idx] = hidden
+                hidden_by_layer[layer_idx] = _apply_entropy_weights(
+                    hidden, out.attentions, layer_idx, seq_len, batch_idx=batch_idx
+                )
 
             results.append((kv_by_layer, hidden_by_layer))
 
@@ -271,15 +332,15 @@ class HFAdapter(BaseAdapter):
         """
         Dequantize stored KV blocks and prepend as past_key_values, then generate.
 
-        When blocks are provided: uses a manual prefill + decode loop with explicit
-        position_ids. This bypasses transformers.generate() which has breaking
-        changes in 4.40+ for legacy past_key_values formats.
+        Uses model.generate() natively for both the no-injection and injection paths.
 
-        When no blocks: delegates to model.generate() normally.
+        Doc-wise RoPE: position_ids for the query are auto-computed by
+        prepare_inputs_for_generation() from cache.get_seq_length(), which
+        equals total_past_tokens. This places query tokens correctly after all
+        injected context without any manual position tracking.
 
-        Doc-wise RoPE: query tokens start at position = total_past_tokens,
-        placing them correctly after all injected context regardless of which
-        layers have stored KV.
+        attention_mask covers past (injected) + query tokens so the model
+        attends to the full context window.
         """
         if not current_tokens:
             raise ValueError("inject_and_generate() called with empty current_tokens")
@@ -287,7 +348,6 @@ class HFAdapter(BaseAdapter):
         input_ids = torch.tensor([current_tokens], dtype=torch.long).to(self.model.device)
 
         if not blocks:
-            # No injection — use generate() directly, no API issues
             attention_mask = torch.ones_like(input_ids, dtype=torch.long)
             with torch.no_grad():
                 out = self.model.generate(
@@ -299,14 +359,147 @@ class HFAdapter(BaseAdapter):
             text = self._tokenizer.decode(sequences[0], skip_special_tokens=True)
             return GenerationOutput(sequences=sequences, text=text)
 
-        # KV injection path: manual decode loop to avoid transformers version issues
+        # KV injection path:
+        #
+        # model.generate() with a pre-built DynamicCache crashes in transformers
+        # 4.44+ because prepare_inputs_for_generation() uses cache.get_seq_length()
+        # to strip already-processed tokens from input_ids, reducing query to 0 tokens.
+        #
+        # Fix: split into two phases:
+        #   Phase 1 — manual prefill: model() call with explicit position_ids,
+        #             processes query tokens against injected KV. No generate() quirks.
+        #   Phase 2 — decode: model.generate() starting from the SECOND token,
+        #             with the prefill cache. Cache length is now N+S, so generate()
+        #             correctly treats the single decode token as position N+S+0.
         past_kv, total_past_tokens = self._build_cache(blocks)
-        return self._manual_generate(
-            input_ids=input_ids,
-            past_kv=past_kv,
-            position_offset=total_past_tokens,
-            generation_kwargs=generation_kwargs,
+        seq_len = input_ids.shape[1]
+        if seq_len == 0:
+            raise ValueError(
+                f"inject_and_generate prefill got empty query tokens (seq_len=0, blocks={len(blocks)}, total_past={total_past_tokens})"
+            )
+        device = self.model.device
+
+        max_new_tokens = int(generation_kwargs.get("max_new_tokens", 20))
+        do_sample = bool(generation_kwargs.get("do_sample", False))
+        temperature = float(generation_kwargs.get("temperature", 1.0))
+        top_p = float(generation_kwargs.get("top_p", 1.0))
+        _raw_eos = generation_kwargs.get(
+            "eos_token_id", getattr(self._tokenizer, "eos_token_id", None)
         )
+        eos_ids: set[int] = set()
+        if _raw_eos is not None:
+            if isinstance(_raw_eos, (list, tuple)):
+                eos_ids = {int(x) for x in _raw_eos}
+            else:
+                eos_ids = {int(_raw_eos)}
+        print(f"[inject] eos_ids={eos_ids}")
+
+        # Phase 1: prefill — process query with injected KV, explicit position_ids
+        pos_ids = torch.arange(
+            total_past_tokens, total_past_tokens + seq_len, device=device
+        ).unsqueeze(0)
+        attn_mask = torch.ones(1, total_past_tokens + seq_len, device=device, dtype=torch.long)
+
+        if pos_ids.shape[1] != seq_len:
+            raise RuntimeError(
+                f"position_ids/query mismatch: pos_ids={tuple(pos_ids.shape)} seq_len={seq_len}"
+            )
+        if attn_mask.shape[1] != total_past_tokens + seq_len:
+            raise RuntimeError(
+                f"attention_mask length mismatch: mask={attn_mask.shape[1]} expected={total_past_tokens + seq_len}"
+            )
+
+        _cache_reported = past_kv.get_seq_length() if hasattr(past_kv, "get_seq_length") else "?"
+        print(
+            f"[inject] Phase1: past_kv reports {_cache_reported} tokens (expected {total_past_tokens}), "
+            f"seq_len={seq_len}, pos_ids[0..2]={pos_ids[0, :3].tolist()}, "
+            f"attn_mask_len={attn_mask.shape[1]}, model.dtype={self.model.dtype}"
+        )
+
+        with torch.no_grad():
+            prefill = self.model(
+                input_ids=input_ids,
+                past_key_values=past_kv,
+                position_ids=pos_ids,
+                attention_mask=attn_mask,
+                use_cache=True,
+            )
+
+        logger.warning("[inject] Phase1 OK: logits.shape=%s", tuple(prefill.logits.shape))
+
+        # Sample first generated token from prefill logits
+        logits = prefill.logits[0, -1, :]
+        if do_sample:
+            logits = logits / max(temperature, 1e-8)
+            if top_p < 1.0:
+                logits = self._top_p_filter(logits, top_p)
+            first_token = int(torch.multinomial(torch.softmax(logits, dim=-1), 1).item())
+        else:
+            first_token = int(logits.argmax().item())
+
+        # Debug: top-5 tokens from Phase 1 to diagnose '!' artifacts
+        _top5 = torch.topk(prefill.logits[0, -1, :], 5)
+        print(
+            f"[inject] Phase1 first_token={first_token} "
+            f"top5={[(int(idx), repr(self._tokenizer.decode([int(idx)]))) for idx in _top5.indices]}"
+        )
+
+        # Phase 2: manual decode loop with explicit position tracking.
+        #
+        # model.generate() with a pre-built cache is unreliable across transformers
+        # versions — prepare_inputs_for_generation() may strip input_ids to 0 tokens
+        # based on cache.get_seq_length(), causing RoPE shape mismatches (size 0 vs N).
+        #
+        # Using model() directly with explicit position_ids and attention_mask at each
+        # step avoids all stripping logic and gives us full control over positions.
+        past_kv_decode = prefill.past_key_values
+        cur_pos = total_past_tokens + seq_len  # first decode token is at position N+S
+        generated: list[int] = [first_token]
+        cur_token = first_token
+
+        for _step in range(max_new_tokens - 1):
+            if cur_token in eos_ids:
+                break
+
+            step_input = torch.tensor([[cur_token]], device=device, dtype=torch.long)
+            step_pos = torch.tensor([[cur_pos]], device=device, dtype=torch.long)
+            # attention_mask covers injected past (N) + query (S) + all generated so far
+            step_mask = torch.ones(1, cur_pos + 1, device=device, dtype=torch.long)
+
+            with torch.no_grad():
+                step_out = self.model(
+                    input_ids=step_input,
+                    past_key_values=past_kv_decode,
+                    position_ids=step_pos,
+                    attention_mask=step_mask,
+                    use_cache=True,
+                )
+
+            logits = step_out.logits[0, -1, :]
+            if do_sample:
+                logits = logits / max(temperature, 1e-8)
+                if top_p < 1.0:
+                    logits = self._top_p_filter(logits, top_p)
+                cur_token = int(torch.multinomial(torch.softmax(logits, dim=-1), 1).item())
+            else:
+                cur_token = int(logits.argmax().item())
+
+            # Debug: top-5 tokens for first 3 Phase 2 steps to diagnose '!' artifacts
+            if _step < 3:
+                _top5s = torch.topk(step_out.logits[0, -1, :], 5)
+                print(
+                    f"[inject] Phase2 step{_step} cur_token={cur_token} "
+                    f"top5={[(int(idx), repr(self._tokenizer.decode([int(idx)]))) for idx in _top5s.indices]}"
+                )
+
+            generated.append(cur_token)
+            past_kv_decode = step_out.past_key_values
+            cur_pos += 1
+
+        all_tokens = current_tokens + generated
+
+        text = self._tokenizer.decode(all_tokens, skip_special_tokens=True)
+        return GenerationOutput(sequences=[all_tokens], text=text)
 
     def generate(
         self,
@@ -327,26 +520,26 @@ class HFAdapter(BaseAdapter):
         blocks: list[KVBlock],
     ) -> tuple[object, int]:
         """
-        Assemble a KV cache from a list of KVBlocks.
+        Assemble a plain DynamicCache from a list of KVBlocks.
 
-        Builds a DynamicCache (transformers >= 4.38) when available.
-        Falls back to legacy tuple-of-tuples for older versions.
+        Uses a standard DynamicCache (no subclass). model.generate() uses
+        cache.get_seq_length() to auto-compute position_ids for the query
+        (doc-wise RoPE), so we need the cache to report the true stored length
+        = total_past_tokens. A plain DynamicCache does this correctly: its
+        get_seq_length() returns key_cache[layer].shape[-2], which equals
+        total_past_tokens for layers with real stored KV.
 
         Every layer gets an entry: real KV for stored layers, 0-length placeholder
-        tensors for unstored layers. All tensors are cast to the model's native dtype
-        so SDPA never sees a dtype mismatch between query and injected KV.
+        tensors for unstored layers. All tensors are cast to the model's native dtype.
 
         Returns:
             (past_key_values, total_past_tokens)
-            total_past_tokens: sum of token counts across all injected blocks,
-                               used to set position_ids and the attention mask offset.
         """
         head_dim = self._d_model // self._num_heads
-        kv_dtype = self.model.dtype  # match model's compute dtype (fp16, bf16, fp32)
-        total_past_tokens = sum(b.token_count for b in blocks)
+        kv_dtype = self.model.dtype
+        total_past_tokens_meta = sum(b.token_count for b in blocks)
+        total_past_tokens_actual = 0
 
-        # Build per-layer (K_cat, V_cat) — 0-length placeholders for unstored layers.
-        # Use _num_kv_heads (not _num_heads) — GQA models have fewer KV heads than Q heads.
         layer_kvs: list[tuple[torch.Tensor, torch.Tensor]] = []
         for layer_idx in range(self._num_layers):
             K_parts: list[torch.Tensor] = []
@@ -359,41 +552,32 @@ class HFAdapter(BaseAdapter):
                 k_scale, v_scale = block.quant_scales[layer_idx]
                 K = torch.from_numpy(K_q.astype(np.float32)) * k_scale
                 V = torch.from_numpy(V_q.astype(np.float32)) * v_scale
-                K = K.to(dtype=kv_dtype, device=self.model.device)
-                V = V.to(dtype=kv_dtype, device=self.model.device)
-                K_parts.append(K)  # [kv_heads, seq_i, head_dim]
-                V_parts.append(V)
+                K_parts.append(K.to(dtype=kv_dtype, device=self.model.device))
+                V_parts.append(V.to(dtype=kv_dtype, device=self.model.device))
 
             if K_parts:
                 K_cat = torch.cat(K_parts, dim=1).unsqueeze(0)  # [1, kv_heads, total_seq, head_dim]
                 V_cat = torch.cat(V_parts, dim=1).unsqueeze(0)
+                seq_from_k = int(K_cat.shape[2])
+                if seq_from_k > total_past_tokens_actual:
+                    total_past_tokens_actual = seq_from_k
             else:
-                # 0-length placeholder: this layer has no prior context.
                 K_cat = torch.zeros(1, self._num_kv_heads, 0, head_dim,
                                     dtype=kv_dtype, device=self.model.device)
-                V_cat = torch.zeros(1, self._num_kv_heads, 0, head_dim,
-                                    dtype=kv_dtype, device=self.model.device)
+                V_cat = torch.zeros_like(K_cat)
 
             layer_kvs.append((K_cat, V_cat))
 
-        # Build a DynamicCache — newer transformers (4.38+) requires an object with
-        # get_seq_length(). We subclass it so that get_seq_length() always returns
-        # total_past_tokens: masking_utils uses this as q_offset for the causal mask,
-        # and it must match the position_ids we pass (which also start at total_past_tokens).
-        # Without this, layers with 0-length placeholders would return 0 from get_seq_length(),
-        # causing the causal mask to be built with the wrong offset.
+        total_past_tokens = total_past_tokens_actual or total_past_tokens_meta
+        if total_past_tokens_meta != total_past_tokens:
+            logger.warning(
+                "KV cache length mismatch: meta=%d actual=%d; using actual cache length",
+                total_past_tokens_meta,
+                total_past_tokens,
+            )
         try:
             from transformers import DynamicCache
-
-            class _InjectedCache(DynamicCache):
-                """DynamicCache with a fixed get_seq_length() for correct causal masking."""
-                _total_past: int
-
-                def get_seq_length(self, layer_idx: int = 0) -> int:  # type: ignore[override]
-                    return self._total_past
-
-            cache = _InjectedCache()
-            cache._total_past = total_past_tokens
+            cache = DynamicCache()
             for layer_idx, (K_cat, V_cat) in enumerate(layer_kvs):
                 cache.update(K_cat, V_cat, layer_idx)
             return cache, total_past_tokens
@@ -409,10 +593,10 @@ class HFAdapter(BaseAdapter):
         generation_kwargs: dict,
     ) -> "GenerationOutput":
         """
-        Manual prefill + greedy/sampling decode loop with explicit position_ids.
+        Legacy manual prefill + decode loop. No longer used — kept for reference.
 
-        Handles: max_new_tokens, do_sample, temperature, top_p, eos_token_id.
-        Called only when KV blocks are injected.
+        inject_and_generate() now uses model.generate() natively, which avoids
+        the causal mask sync issue that caused '!' token artifacts in this loop.
         """
         max_new_tokens: int = generation_kwargs.get("max_new_tokens", 20)
         do_sample: bool = generation_kwargs.get("do_sample", False)
@@ -449,6 +633,20 @@ class HFAdapter(BaseAdapter):
         current_pkv = fwd.past_key_values
         next_pos = position_offset + seq_len
 
+        # After the prefill, the KV cache has grown by seq_len.
+        # _InjectedCache.get_seq_length() was set to position_offset (the initial
+        # injected past), but the model uses get_seq_length() to compute the causal
+        # mask offset for each decode step. If it stays at position_offset, the
+        # causal mask only allows attending to positions 0..position_offset, masking
+        # out the query tokens that were just processed in the prefill — so decode
+        # tokens can't attend to the full history and generate garbage.
+        # Fix: keep _total_past in sync with the actual cache length after each step.
+        def _sync_cache_length(pkv, length: int) -> None:
+            if hasattr(pkv, "_total_past"):
+                pkv._total_past = length
+
+        _sync_cache_length(current_pkv, next_pos)
+
         # Autoregressive decode
         for _ in range(max_new_tokens):
             logits = fwd.logits[0, -1, :]  # [vocab]
@@ -480,6 +678,7 @@ class HFAdapter(BaseAdapter):
                 )
             current_pkv = fwd.past_key_values
             next_pos += 1
+            _sync_cache_length(current_pkv, next_pos)
 
         text = self._tokenizer.decode(generated, skip_special_tokens=True)
         return GenerationOutput(sequences=[generated], text=text)

@@ -193,12 +193,12 @@ def sample_kv_block(mock_adapter, base_config) -> KVBlock:
         layers=base_config.store_layers,
     )
 
-    from kvmemory.core.retrieval import compute_retrieval_vec
+    from kvmemory.core.retrieval import compute_k_vec
     from kvmemory.core.write_pipeline import quantize_int8
 
     hidden_vecs = {
-        layer: compute_retrieval_vec(hidden, len(tokens))
-        for layer, hidden in hidden_by_layer.items()
+        layer: compute_k_vec(K)
+        for layer, (K, _) in kv_by_layer_float.items()
     }
 
     kv_by_layer_quant = {}

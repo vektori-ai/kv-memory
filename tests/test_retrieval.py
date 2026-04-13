@@ -45,36 +45,49 @@ class TestComputeRetrievalVecFixed:
 
     @pytest.mark.slow
     def test_discrimination(self):
-        """Slow, requires model: cosine similarity between two different texts < 0.98."""
+        """
+        Slow, requires model: entropy-weighted retrieval vectors for semantically
+        different texts must have cosine similarity < 0.95.
+
+        Threshold is 0.95 (not 0.98) — the benchmark showed mean pooling alone
+        produces 0.985-0.992 for completely unrelated facts. Entropy weighting
+        via HFAdapter must push discrimination below this threshold.
+        """
         pytest.importorskip("transformers")
         from transformers import AutoModelForCausalLM, AutoTokenizer
         import torch
+        from kvmemory.adapters.hf_adapter import HFAdapter
 
         model_name = "sshleifer/tiny-gpt2"
         try:
             tokenizer = AutoTokenizer.from_pretrained(model_name)
+            if tokenizer.pad_token_id is None:
+                tokenizer.pad_token_id = tokenizer.eos_token_id
             model = AutoModelForCausalLM.from_pretrained(model_name)
             model.eval()
         except Exception:
             pytest.skip(f"Model {model_name} unavailable")
 
+        adapter = HFAdapter(model, tokenizer)
         layers = [0]
 
-        def _get_hidden(text: str) -> torch.Tensor:
-            toks = tokenizer.encode(text, return_tensors="pt")
-            with torch.no_grad():
-                out = model(toks, output_hidden_states=True, use_cache=False)
-            return out.hidden_states[1][0].float()  # [seq, d_model]
+        texts = [
+            "The capital of France is Paris and it is known for the Eiffel Tower.",
+            "Water boils at 100 degrees Celsius at standard atmospheric pressure.",
+        ]
 
-        hidden_a = _get_hidden("The capital of France is Paris and it is known for the Eiffel Tower.")
-        hidden_b = _get_hidden("Water boils at 100 degrees Celsius at standard atmospheric pressure.")
+        vecs = []
+        for text in texts:
+            toks = tokenizer.encode(text)
+            _, hidden_by_layer = adapter.capture(toks, text, layers)
+            hidden = hidden_by_layer[0]
+            vecs.append(compute_retrieval_vec(hidden, len(toks)))
 
-        vec_a = compute_retrieval_vec(hidden_a, hidden_a.shape[0])
-        vec_b = compute_retrieval_vec(hidden_b, hidden_b.shape[0])
-        cosine_sim = float(np.dot(vec_a, vec_b))
-        assert cosine_sim < 0.98, (
-            f"Vectors are too similar (cosine={cosine_sim:.4f}), "
-            "mean pooling may not be discriminating correctly."
+        cosine_sim = float(np.dot(vecs[0], vecs[1]))
+        assert cosine_sim < 0.95, (
+            f"Vectors too similar after entropy weighting (cosine={cosine_sim:.4f}). "
+            "Expected < 0.95. Mean pooling alone hits 0.985+ — entropy weighting must "
+            "push discrimination lower. Check _apply_entropy_weights in hf_adapter.py."
         )
 
 
