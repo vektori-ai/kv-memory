@@ -268,4 +268,9 @@ def _resolution_rank(claim: FactClaim) -> tuple[int, str, float]:
 def _coerce_claim(raw: FactClaim | dict) -> FactClaim:
     if isinstance(raw, FactClaim):
         return raw
-    return FactClaim(**raw)
+    claim_fields = FactClaim.__dataclass_fields__
+    return FactClaim(**{
+        key: value
+        for key, value in raw.items()
+        if key in claim_fields
+    })

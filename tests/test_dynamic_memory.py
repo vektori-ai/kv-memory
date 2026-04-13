@@ -47,6 +47,20 @@ def test_conflict_detection_same_key_different_value():
     }]
 
 
+def test_conflict_detection_accepts_payload_with_conflicts_field():
+    old, new = extract_fact_claims(
+        "The project deadline was originally March 29. Actually, the project deadline is March 31.",
+        observed_at="2026-04-13T00:00:00+00:00",
+    )
+    old_payload = old.to_payload()
+    old_payload["conflicts"] = []
+
+    conflicts = find_conflicts(new, [old_payload])
+
+    assert conflicts[0]["prior_value"] == "March 29"
+    assert conflicts[0]["new_value"] == "March 31"
+
+
 def test_resolution_prefers_correction_over_older_history():
     claims = extract_fact_claims(
         "The project deadline was originally March 29. Actually, the project deadline is March 31.",
