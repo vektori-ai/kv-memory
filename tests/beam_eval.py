@@ -388,7 +388,7 @@ async def run_kv_memory_eval(
     rather than going through memory.generate(), which gives us fine-grained
     breakdown without modifying the public API.
     """
-    from kvmemory.core.retrieval import stage1_coarse, stage2_rerank_mmr
+    from kvmemory.core.retrieval import stage1_coarse, stage2_rerank
     from kvmemory.core.injector import inject_and_generate
     from kvmemory.memory import _build_session_filter
 
@@ -550,8 +550,8 @@ async def run_kv_memory_eval(
                 retrieval_query_token_count=len(retrieval_tokens),
             )
 
-        # Stage 2: MMR rerank
-        final_ids = stage2_rerank_mmr(
+        # Stage 2: configured rerank
+        final_ids = stage2_rerank(
             candidate_ids=candidate_ids,
             query_vecs=query_vecs,
             config=memory.config,
@@ -1135,7 +1135,7 @@ def print_comparison(
         print()
         print("  KV Memory latency breakdown:")
         row("    Stage 1 ANN (ms)", f"{kv_metrics.avg_stage1_ms:.0f}", "", "")
-        row("    Stage 2 MMR (ms)", f"{kv_metrics.avg_stage2_ms:.0f}", "", "")
+        row("    Stage 2 Rerank (ms)", f"{kv_metrics.avg_stage2_ms:.0f}", "", "")
         row("    Fetch KV (ms)",    f"{kv_metrics.avg_fetch_ms:.0f}", "", "")
         row("    Inject+Gen (ms)",  f"{kv_metrics.avg_generate_ms:.0f}", "", "")
 
@@ -1171,6 +1171,8 @@ async def main(args) -> None:
             "scale": args.scale,
             "n": args.n,
             "retrieval_layers": args.retrieval_layers,
+            "retrieval_query_source": args.retrieval_query_source,
+            "stage2_reranker": args.stage2_reranker,
             "token_budget": args.token_budget,
             "max_new_tokens": args.max_new_tokens,
         },
@@ -1263,6 +1265,8 @@ async def main(args) -> None:
         config_kwargs = dict(
             model_id=sanitize_model_id(args.model),
             retrieval_layers=args.retrieval_layers,
+            retrieval_query_source=args.retrieval_query_source,
+            stage2_reranker=args.stage2_reranker,
             token_budget=args.token_budget,
             importance_threshold=0.0 if args.synthetic else 0.3,
         )
@@ -1406,6 +1410,13 @@ if __name__ == "__main__":
                         help="HuggingFace model name or path")
     parser.add_argument("--retrieval-layers", type=int, nargs="+", default=[8, 16, 24],
                         help="Layers to use for retrieval (default: 8 16 24)")
+    parser.add_argument("--retrieval-query-source", default="k_vectors",
+                        choices=["k_vectors", "q_vectors"],
+                        help="Query vector source for retrieval (default: k_vectors). "
+                             "Use q_vectors for routerless Q-to-K retrieval.")
+    parser.add_argument("--stage2-reranker", default="mmr",
+                        choices=["mmr", "qk"],
+                        help="Stage 2 selector (default: mmr). qk ranks by pure Q.K relevance.")
     parser.add_argument("--token-budget", type=int, default=2000,
                         help="Hard cap on injected tokens (default: 2000)")
     parser.add_argument("--rag-context-tokens", type=int, default=4096,

@@ -91,6 +91,34 @@ def compute_k_vec(K: torch.Tensor) -> np.ndarray:
     return normed.cpu().numpy().astype(np.float32)
 
 
+def compute_q_vec(Q: torch.Tensor, num_kv_heads: Optional[int] = None) -> np.ndarray:
+    """
+    Compute a retrieval query vector from attention Q tensors.
+
+    Q has query-head shape [num_heads, seq, head_dim]. Stored memory K vectors
+    use KV-head shape [num_kv_heads, seq, head_dim]. For GQA models, multiple
+    query heads share one KV head in attention, so each query-head group is
+    averaged down to the matching KV-head shape before pooling.
+    """
+    if Q.dim() != 3:
+        raise ValueError(f"Expected [num_heads, seq, head_dim], got {Q.shape}")
+
+    q = Q.float()
+    q_heads, seq_len, head_dim = q.shape
+    if num_kv_heads is not None and num_kv_heads > 0 and q_heads != num_kv_heads:
+        if q_heads % num_kv_heads != 0:
+            raise ValueError(
+                f"Cannot group {q_heads} query heads into {num_kv_heads} KV heads"
+            )
+        group_size = q_heads // num_kv_heads
+        q = q.reshape(num_kv_heads, group_size, seq_len, head_dim).mean(dim=1)
+
+    pooled = q.mean(dim=1)       # [heads_or_kv_heads, head_dim]
+    flat = pooled.flatten()
+    normed = F.normalize(flat, dim=0)
+    return normed.cpu().numpy().astype(np.float32)
+
+
 def compute_query_vecs(
     tokens: list[int],
     adapter: "BaseAdapter",
@@ -107,6 +135,33 @@ def compute_query_vecs(
     into the attention subspace via W_K, giving more discriminative signal
     for short texts than raw hidden states.
     """
+    query_source = getattr(
+        config,
+        "retrieval_query_source",
+        getattr(config, "retrieval_vec_source", "k_vectors"),
+    )
+    store_source = getattr(config, "retrieval_vec_source", "k_vectors")
+    if query_source == "q_vectors" and store_source != "k_vectors":
+        logger.warning(
+            "retrieval_query_source='q_vectors' requires retrieval_vec_source='k_vectors'; "
+            "falling back to hidden-state query capture"
+        )
+    elif query_source == "q_vectors":
+        capture_query_vecs = getattr(adapter, "capture_query_vecs", None)
+        if capture_query_vecs is not None:
+            try:
+                return capture_query_vecs(tokens=tokens, layers=config.retrieval_layers)
+            except Exception as exc:
+                logger.warning(
+                    "Q-vector query capture failed (%s); falling back to K-vector query capture",
+                    exc,
+                )
+        else:
+            logger.warning(
+                "Adapter %s does not expose capture_query_vecs(); falling back to K-vector query capture",
+                type(adapter).__name__,
+            )
+
     kv_by_layer, hidden_by_layer = adapter.capture(
         tokens=tokens,
         text="",
@@ -204,15 +259,7 @@ def stage2_rerank_mmr(
     middle_layer = config.retrieval_layers[len(config.retrieval_layers) // 2]
 
     def relevance(cand: dict) -> float:
-        score = 0.0
-        for layer, w in layer_weights.items():
-            key = f"layer_{layer}"
-            if key not in (cand["vector"] or {}):
-                continue
-            q = query_vecs[layer]
-            k = np.array(cand["vector"][key], dtype=np.float32)
-            score += w * float(np.dot(q, k))
-        return score
+        return _candidate_relevance(cand, query_vecs, layer_weights)
 
     selected: list[str] = []
     selected_vecs: list[np.ndarray] = []
@@ -284,9 +331,117 @@ def stage2_rerank_mmr(
     return selected
 
 
+def stage2_rerank_qk(
+    candidate_ids: list[str],
+    query_vecs: dict[int, np.ndarray],
+    config: "KVMemoryConfig",
+    vector_db: "VectorDB",
+    token_budget: int,
+    min_relevance: float = 0.0,
+) -> list[str]:
+    """
+    Stage 2: pure query-to-key relevance rank with hard token-budget enforcement.
+
+    If retrieval_query_source == "q_vectors", relevance is native query-Q versus
+    memory-K. Otherwise this degenerates to the older query-K versus memory-K
+    score while still skipping the MMR diversity penalty.
+    """
+    if not candidate_ids:
+        return []
+
+    candidates = vector_db.fetch_with_vectors(config.model_id, candidate_ids)
+    if not candidates:
+        return []
+
+    layer_weights = _default_layer_weights(config.retrieval_layers)
+    scored: list[tuple[float, dict]] = []
+    for cand in candidates:
+        rel = _candidate_relevance(cand, query_vecs, layer_weights)
+        if min_relevance > 0.0 and rel < min_relevance:
+            continue
+        scored.append((rel, cand))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+
+    selected: list[str] = []
+    tokens_used = 0
+    for _rel, cand in scored:
+        if len(selected) >= config.final_top_k:
+            break
+
+        n_tokens = (cand["payload"] or {}).get("token_count", 0)
+        if tokens_used + n_tokens > token_budget:
+            logger.debug(
+                "QK: block %s skipped -- %d tokens > %d remaining budget",
+                cand["id"], n_tokens, token_budget - tokens_used,
+            )
+            continue
+
+        selected.append(cand["id"])
+        tokens_used += n_tokens
+
+    logger.debug(
+        "Stage 2 QK selected %d blocks, %d tokens used (budget: %d)",
+        len(selected),
+        tokens_used,
+        token_budget,
+    )
+    return selected
+
+
+def stage2_rerank(
+    candidate_ids: list[str],
+    query_vecs: dict[int, np.ndarray],
+    config: "KVMemoryConfig",
+    vector_db: "VectorDB",
+    token_budget: int,
+    mmr_lambda: float = 0.7,
+    min_relevance: float = 0.0,
+) -> list[str]:
+    """Dispatch Stage 2 selection according to config.stage2_reranker."""
+    reranker = getattr(config, "stage2_reranker", "mmr")
+    if reranker == "qk":
+        return stage2_rerank_qk(
+            candidate_ids=candidate_ids,
+            query_vecs=query_vecs,
+            config=config,
+            vector_db=vector_db,
+            token_budget=token_budget,
+            min_relevance=min_relevance,
+        )
+    if reranker != "mmr":
+        raise ValueError(f"Unknown stage2_reranker={reranker!r}; expected 'mmr' or 'qk'")
+    return stage2_rerank_mmr(
+        candidate_ids=candidate_ids,
+        query_vecs=query_vecs,
+        config=config,
+        vector_db=vector_db,
+        token_budget=token_budget,
+        mmr_lambda=mmr_lambda,
+        min_relevance=min_relevance,
+    )
+
+
 # ------------------------------------------------------------------
 # Internal helpers
 # ------------------------------------------------------------------
+
+def _candidate_relevance(
+    cand: dict,
+    query_vecs: dict[int, np.ndarray],
+    layer_weights: dict[int, float],
+) -> float:
+    score = 0.0
+    vectors = cand["vector"] or {}
+    for layer, w in layer_weights.items():
+        key = f"layer_{layer}"
+        if key not in vectors or layer not in query_vecs:
+            continue
+        q = query_vecs[layer]
+        k = np.array(vectors[key], dtype=np.float32)
+        score += w * float(np.dot(q, k))
+    return score
+
 
 def _default_layer_weights(retrieval_layers: list[int]) -> dict[int, float]:
     """25% shallow, 50% middle, 25% deep for 3-layer setup. Equal split otherwise."""

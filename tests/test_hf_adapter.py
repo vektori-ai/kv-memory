@@ -388,6 +388,67 @@ class TestCaptureParity:
             )
 
 
+class TestQueryVecCapture:
+    def test_capture_query_vecs_groups_gqa_heads(self):
+        class TinyConfig:
+            num_hidden_layers = 1
+            hidden_size = 4
+            num_attention_heads = 4
+            num_key_value_heads = 2
+
+        class TinyAttention(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.head_dim = 1
+                self.q_proj = torch.nn.Linear(4, 4, bias=False)
+                with torch.no_grad():
+                    self.q_proj.weight.copy_(torch.eye(4))
+
+            def forward(self, hidden_states, position_embeddings=None, **kwargs):
+                return hidden_states, None
+
+        class TinyLayer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = TinyAttention()
+
+        class TinyBackbone(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = torch.nn.ModuleList([TinyLayer()])
+
+        class TinyModel(torch.nn.Module):
+            config = TinyConfig()
+            dtype = torch.float32
+
+            def __init__(self):
+                super().__init__()
+                self.model = TinyBackbone()
+
+            @property
+            def device(self):
+                return torch.device("cpu")
+
+            def forward(self, input_ids, attention_mask=None, **kwargs):
+                batch, seq_len = input_ids.shape
+                hidden = torch.tensor(
+                    [[[1.0, 2.0, 3.0, 4.0]] * seq_len] * batch,
+                    dtype=torch.float32,
+                )
+                for layer in self.model.layers:
+                    hidden, _ = layer.self_attn(hidden_states=hidden, position_embeddings=None)
+                return type("TinyOutput", (), {})()
+
+        adapter = HFAdapter(TinyModel(), tokenizer=object())
+        vecs = adapter.capture_query_vecs(tokens=[1, 2], layers=[0])
+
+        expected = torch.tensor([1.5, 3.5], dtype=torch.float32)
+        expected = torch.nn.functional.normalize(expected, dim=0).numpy()
+        assert set(vecs) == {0}
+        assert vecs[0].shape == (2,)
+        np.testing.assert_allclose(vecs[0], expected, atol=1e-6)
+
+
 # ------------------------------------------------------------------
 # Real HF model tests (slow, requires GPU + model download)
 # ------------------------------------------------------------------

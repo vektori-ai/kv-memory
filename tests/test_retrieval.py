@@ -18,12 +18,15 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F
 
 from kvmemory.config import KVMemoryConfig
 from kvmemory.core.retrieval import (
     _default_layer_weights,
     compute_query_vecs,
+    compute_q_vec,
     compute_retrieval_vec,
+    stage2_rerank_qk,
     stage2_rerank_mmr,
 )
 from kvmemory.storage.schema import KVBlock
@@ -121,6 +124,25 @@ class TestComputeRetrievalVec:
         hidden = torch.randn(64)  # Missing seq dim
         with pytest.raises(ValueError):
             compute_retrieval_vec(hidden, 5)
+
+
+class TestComputeQVec:
+    def test_groups_query_heads_to_kv_heads(self):
+        q = torch.zeros(4, 2, 3)
+        q[0:2, :, :] = 1.0
+        q[2:4, :, :] = 2.0
+
+        vec = compute_q_vec(q, num_kv_heads=2)
+        expected = torch.tensor([1, 1, 1, 2, 2, 2], dtype=torch.float32)
+        expected = F.normalize(expected, dim=0).numpy()
+
+        assert vec.shape == (6,)
+        np.testing.assert_allclose(vec, expected, atol=1e-6)
+
+    def test_invalid_grouping_raises(self):
+        q = torch.randn(5, 2, 3)
+        with pytest.raises(ValueError):
+            compute_q_vec(q, num_kv_heads=2)
 
 
 class TestLayerWeights:
@@ -281,6 +303,56 @@ class TestStage2MMR:
         # dup and diverse compete for slot 2; with lambda=0.5 diverse should win
         # (this is probabilistic based on the vectors, but with these extreme values it's deterministic)
         assert len(selected) == 2
+
+
+class TestStage2QK:
+    def test_selects_highest_relevance_under_budget(self):
+        layers = [1]
+        query = np.array([1.0, 0.0], dtype=np.float32)
+        candidates = [
+            {"id": "bad", "vector": {"layer_1": [-1.0, 0.0]}, "payload": {"token_count": 10}},
+            {"id": "good", "vector": {"layer_1": [1.0, 0.0]}, "payload": {"token_count": 10}},
+            {"id": "off", "vector": {"layer_1": [0.0, 1.0]}, "payload": {"token_count": 10}},
+        ]
+        mock_db = MagicMock()
+        mock_db.fetch_with_vectors.return_value = candidates
+        config = KVMemoryConfig(
+            model_id="test",
+            retrieval_layers=layers,
+            token_budget=20,
+            final_top_k=2,
+        )
+
+        selected = stage2_rerank_qk(
+            candidate_ids=[c["id"] for c in candidates],
+            query_vecs={1: query},
+            config=config,
+            vector_db=mock_db,
+            token_budget=20,
+        )
+
+        assert selected == ["good", "off"]
+
+    def test_respects_token_budget(self):
+        layers = [1]
+        query = np.array([1.0, 0.0], dtype=np.float32)
+        candidates = [
+            {"id": "large", "vector": {"layer_1": [1.0, 0.0]}, "payload": {"token_count": 30}},
+            {"id": "small", "vector": {"layer_1": [0.9, 0.1]}, "payload": {"token_count": 10}},
+        ]
+        mock_db = MagicMock()
+        mock_db.fetch_with_vectors.return_value = candidates
+        config = KVMemoryConfig(model_id="test", retrieval_layers=layers, final_top_k=2)
+
+        selected = stage2_rerank_qk(
+            candidate_ids=[c["id"] for c in candidates],
+            query_vecs={1: query},
+            config=config,
+            vector_db=mock_db,
+            token_budget=10,
+        )
+
+        assert selected == ["small"]
 
 
 class TestRecallAt10:

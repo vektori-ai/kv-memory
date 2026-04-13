@@ -41,6 +41,12 @@ class KVMemoryConfig:
     #                     More discriminative for short chunks; fixes retrieval collapse.
     #   "hidden_states" — legacy: use mean-pooled hidden states (d_model dims).
     retrieval_vec_source: str = "k_vectors"
+    # Query vector source for read-time retrieval.
+    # "k_vectors" keeps the current query-K vs memory-K behavior.
+    # "q_vectors" probes routerless Q-to-K retrieval using the model's native Q.
+    retrieval_query_source: str = "k_vectors"
+    # Stage 2 selector: "mmr" for relevance/diversity, "qk" for pure Q.K relevance.
+    stage2_reranker: str = "mmr"
 
     # Infrastructure
     qdrant_url: str = "localhost"

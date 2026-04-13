@@ -704,7 +704,7 @@ Minimum implementation:
 ```text
 1. Add native query-Q capture.
 2. Add stage2_rerank_qk.
-3. Add --rerank mmr|qk to tests/beam_eval.py.
+3. Add --stage2-reranker mmr|qk to tests/beam_eval.py.
 4. Add selected chunk diagnostics.
 5. Add min token guard.
 ```
@@ -727,6 +727,24 @@ If Q-K rerank does not improve evidence selection:
 ```text
 Reassess whether trained router projections or hybrid lexical/embedding
 retrieval are required.
+```
+
+Implementation checkpoint:
+
+```text
+KVMemoryConfig.retrieval_query_source = "k_vectors" | "q_vectors"
+KVMemoryConfig.stage2_reranker        = "mmr" | "qk"
+HFAdapter.capture_query_vecs()
+stage2_rerank_qk()
+BEAM CLI flags:
+  --retrieval-query-source q_vectors
+  --stage2-reranker qk
+```
+
+Local BEAM command for the routerless Q-K probe:
+
+```powershell
+python -m tests.beam_eval --hf --scale 100K --n 5 --model .\models\Qwen2.5-7B-Instruct --dtype float16 --retrieval-layers 8 16 24 --capture-batch-size 1 --max-new-tokens 50 --retrieval-query-source q_vectors --stage2-reranker qk --output results_beam_local_100K_n5_qk.json
 ```
 
 ## 17. Open Risks

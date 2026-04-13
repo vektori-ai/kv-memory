@@ -25,7 +25,7 @@ from .adapters.base import BaseAdapter
 from .config import KVMemoryConfig
 from .core.injector import inject_and_generate
 from .core.queue import WriteQueue
-from .core.retrieval import compute_query_vecs, stage1_coarse, stage2_rerank_mmr
+from .core.retrieval import compute_query_vecs, stage1_coarse, stage2_rerank
 from .core.write_pipeline import run_write_pipeline
 from .observability import RunObserver
 from .storage.kv_store import KVStore
@@ -180,7 +180,7 @@ class KVMemory:
             )
 
         stage2_start = time.perf_counter()
-        final_ids = stage2_rerank_mmr(
+        final_ids = stage2_rerank(
             candidate_ids=candidate_ids,
             query_vecs=query_vecs,
             config=self.config,

@@ -24,6 +24,7 @@ import numpy as np
 import torch
 
 from .base import BaseAdapter
+from ..core.retrieval import compute_q_vec
 from ..storage.schema import KVBlock, GenerationOutput
 
 logger = logging.getLogger(__name__)
@@ -319,6 +320,75 @@ class HFAdapter(BaseAdapter):
 
         return results
 
+    def capture_query_vecs(
+        self,
+        tokens: list[int],
+        layers: list[int],
+    ) -> dict[int, np.ndarray]:
+        """
+        Capture native attention-Q retrieval vectors for the current query.
+
+        This is the routerless-MSA path: it uses the model's own q_proj inside
+        each requested attention layer, applies RoPE when the model passes
+        position_embeddings to attention, then pools Q heads down to KV-head
+        groups for GQA models so the vector dimension matches stored K vectors.
+        """
+        if not tokens:
+            raise ValueError("capture_query_vecs() called with empty token list")
+
+        decoder_layers = self._decoder_layers()
+        target_layers = [layer for layer in layers if 0 <= layer < len(decoder_layers)]
+        if not target_layers:
+            return {}
+
+        captured: dict[int, np.ndarray] = {}
+        handles = []
+
+        for layer_idx in target_layers:
+            attn = getattr(decoder_layers[layer_idx], "self_attn", None)
+            if attn is None or not hasattr(attn, "q_proj"):
+                continue
+
+            def _hook(module, args, kwargs, *, layer_idx=layer_idx):
+                hidden_states = kwargs.get("hidden_states")
+                if hidden_states is None and args:
+                    hidden_states = args[0]
+                if hidden_states is None:
+                    return
+
+                head_dim = getattr(module, "head_dim", self.head_dim)
+                input_shape = hidden_states.shape[:-1]
+                q = module.q_proj(hidden_states).view(*input_shape, -1, head_dim).transpose(1, 2)
+
+                position_embeddings = kwargs.get("position_embeddings")
+                if position_embeddings is not None:
+                    q = self._apply_query_rope(module, q, position_embeddings)
+
+                captured[layer_idx] = compute_q_vec(q[0], num_kv_heads=self.num_kv_heads)
+
+            handles.append(attn.register_forward_pre_hook(_hook, with_kwargs=True))
+
+        if not handles:
+            raise NotImplementedError("No attention q_proj modules found for query-Q capture")
+
+        try:
+            device = self.model.device
+            input_ids = torch.tensor([tokens], dtype=torch.long, device=device)
+            attn_mask = torch.ones_like(input_ids)
+            with torch.no_grad():
+                self.model(
+                    input_ids=input_ids,
+                    attention_mask=attn_mask,
+                    output_hidden_states=False,
+                    output_attentions=False,
+                    use_cache=False,
+                )
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        return captured
+
     # ------------------------------------------------------------------
     # inject_and_generate()
     # ------------------------------------------------------------------
@@ -461,6 +531,34 @@ class HFAdapter(BaseAdapter):
         except ImportError:
             # Fallback for very old transformers
             return tuple(layer_kvs), total_past_tokens
+
+    def _decoder_layers(self):
+        """Return the model's decoder layer list for HF causal LMs."""
+        model = getattr(self.model, "model", None)
+        if model is not None and hasattr(model, "layers"):
+            return model.layers
+        if hasattr(self.model, "transformer") and hasattr(self.model.transformer, "h"):
+            return self.model.transformer.h
+        raise NotImplementedError(
+            f"Cannot locate decoder layers for {type(self.model).__name__}"
+        )
+
+    def _apply_query_rope(self, attn_module, q: torch.Tensor, position_embeddings) -> torch.Tensor:
+        """Apply the model module's rotary helper to query states when available."""
+        try:
+            import importlib
+            model_module = importlib.import_module(type(attn_module).__module__)
+            apply_rotary_pos_emb = getattr(model_module, "apply_rotary_pos_emb")
+        except Exception:
+            return q
+
+        try:
+            cos, sin = position_embeddings
+            q_rot, _ = apply_rotary_pos_emb(q, q, cos, sin)
+            return q_rot
+        except Exception as exc:
+            logger.debug("Query RoPE application failed; using pre-RoPE Q: %s", exc)
+            return q
 
     def _manual_generate(
         self,
