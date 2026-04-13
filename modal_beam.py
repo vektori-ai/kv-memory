@@ -143,7 +143,8 @@ def run_diagnostic(model_key: str = "0.5b"):
       If this passes but Part A fails → pure retrieval problem.
       If this also fails → injection mechanism is broken.
     """
-    import sys, asyncio, numpy as np
+    import sys, asyncio, numpy as np, logging
+    logging.basicConfig(level=logging.WARNING, format="%(name)s %(levelname)s %(message)s")
     sys.path.insert(0, "/root/kv-memory")
 
     import torch
@@ -272,27 +273,52 @@ def run_diagnostic(model_key: str = "0.5b"):
 
     oracle_hits = 0
     for context, question, gold in facts:
-        # For instruct models: store context as the opening of a user message
-        # (no close tag) so the captured KV occupies positions 0..N in a
-        # structurally valid chat prefix that matches Qwen2.5-Instruct's training format.
+        # CRITICAL FIX: Tokenize the full prompt in ONE PASS to avoid boundary misalignment.
+        # Separate tokenization causes token boundaries to differ from single-pass tokenization,
+        # breaking attention alignment and causing hallucination of tokens like "!" and markdown.
         #
-        # Full sequence (injected KV + query tokens):
+        # Full sequence (to be split into context_tokens and query_tokens):
         #   <|im_start|>system\nYou are a helpful assistant.<|im_end|>\n
         #   <|im_start|>user\nContext: {context}\n\nAnswer in one phrase.\n\n{question}<|im_end|>\n
         #   <|im_start|>assistant\n
-        #
-        # ctx_tokens (captured & injected as KV):
-        #   system message + start of user message (no close tag yet)
-        # q_tokens (hit prefill):
-        #   rest of user message + assistant open tag
+        
         if is_instruct:
-            ctx_tokens = adapter.tokenizer.encode(
+            # Build and tokenize the FULL prompt in one pass for proper token boundaries
+            full_prompt = (
                 f"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
-                f"<|im_start|>user\nContext: {context}\n\n",
-                add_special_tokens=False,
+                f"<|im_start|>user\nContext: {context}\n\n"
+                f"Answer in one phrase.\n\n{question}<|im_end|>\n"
             )
+            full_tokens = adapter.tokenizer.encode(full_prompt, add_special_tokens=False)
+            
+            # Find the split point by locating the "Answer" delimiter in the tokenized sequence
+            answer_delimiter = "\n\nAnswer in one phrase.\n\n"
+            answer_delim_tokens = adapter.tokenizer.encode(answer_delimiter, add_special_tokens=False)
+            
+            # Search for the delimiter pattern in full_tokens
+            split_idx = None
+            for idx in range(len(full_tokens) - len(answer_delim_tokens) + 1):
+                if full_tokens[idx:idx + len(answer_delim_tokens)] == answer_delim_tokens:
+                    split_idx = idx
+                    break
+            
+            if split_idx is None:
+                # Fallback: estimate based on encoding parts separately
+                ctx_prefix = (
+                    f"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+                    f"<|im_start|>user\nContext: "
+                )
+                ctx_prefix_tokens = adapter.tokenizer.encode(ctx_prefix, add_special_tokens=False)
+                ctx_content_tokens = adapter.tokenizer.encode(context, add_special_tokens=False)
+                split_idx = len(ctx_prefix_tokens) + len(ctx_content_tokens) + len(answer_delim_tokens)
+            
+            ctx_tokens = full_tokens[:split_idx]
+            q_tokens = full_tokens[split_idx:]
+            # Append the assistant opening that was left out of full_prompt
+            q_tokens.extend(adapter.tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False))
         else:
             ctx_tokens = adapter.tokenizer.encode(context)
+            q_tokens = adapter.tokenizer.encode(f"Q: {question}\nA:")
 
         store_layers = memory.config.store_layers
         kv_by_layer, hidden_by_layer = adapter.capture(
@@ -307,79 +333,33 @@ def run_diagnostic(model_key: str = "0.5b"):
 
         n_ctx = len(ctx_tokens)
 
-        # For the oracle test, bypass INT8 quantization entirely and build the
-        # past_key_values cache directly from the raw FP16 tensors.
-        # This isolates injection mechanism correctness from quantization precision.
-        # (INT8 with per-tensor scale works fine for 0.5B; 7B has higher dynamic range.)
-        if is_instruct:
-            # ctx_tokens opened a user turn: <|im_start|>user\nContext: {ctx}\n\n
-            # q_tokens must CONTINUE that same user turn (no new <|im_start|>user):
-            #   Answer in one phrase.\n\n{question}<|im_end|>\n<|im_start|>assistant\n
-            q_tokens = adapter.tokenizer.encode(
-                f"Answer in one phrase.\n\n{question}<|im_end|>\n<|im_start|>assistant\n",
-                add_special_tokens=False,
-            )
-        else:
-            q_tokens = adapter.tokenizer.encode(f"Q: {question}\nA:")
-
-        # Build cache directly (no quantization round-trip)
-        from kvmemory.adapters.hf_adapter import HFAdapter
-        import torch
-
-        head_dim = adapter._d_model // adapter._num_heads
-        kv_dtype = adapter.model.dtype
-        device = adapter.model.device
-
-        try:
-            from transformers import DynamicCache
-
-            class _DirectCache(DynamicCache):
-                _total_past: int
-                def get_seq_length(self, layer_idx: int = 0) -> int:
-                    return self._total_past
-
-            cache = _DirectCache()
-            cache._total_past = n_ctx
-            for li in range(adapter._num_layers):
-                if li in kv_by_layer:
-                    K, V = kv_by_layer[li]
-                    K_in = K.to(dtype=kv_dtype, device=device).unsqueeze(0)
-                    V_in = V.to(dtype=kv_dtype, device=device).unsqueeze(0)
-                else:
-                    K_in = torch.zeros(1, adapter._num_kv_heads, 0, head_dim, dtype=kv_dtype, device=device)
-                    V_in = torch.zeros_like(K_in)
-                cache.update(K_in, V_in, li)
-
-            input_ids = torch.tensor([q_tokens], dtype=torch.long, device=device)
-            out = adapter._manual_generate(
-                input_ids=input_ids,
-                past_kv=cache,
-                position_offset=n_ctx,
-                generation_kwargs={"max_new_tokens": 20, "do_sample": False},
-            )
-        except Exception as e:
-            print(f"  Direct cache failed ({e}), falling back to quantized path")
-            kv_q, scales = {}, {}
-            for l, (K, V) in kv_by_layer.items():
-                Kq, ks = quantize_int8(K.float())
-                Vq, vs = quantize_int8(V.float())
-                kv_q[l] = (Kq, Vq)
-                scales[l] = (ks, vs)
-            block = KVBlock.new(
-                model_id=memory.config.model_id,
-                session_id="oracle",
-                chunk_text=context,
-                token_count=n_ctx,
-                hidden_vecs=hidden_vecs,
-                kv_by_layer=kv_q,
-                quant_scales=scales,
-                original_positions=list(range(n_ctx)),
-            )
-            out = inject_and_generate(
-                adapter=adapter, blocks=[block],
-                current_tokens=q_tokens,
-                generation_kwargs={"max_new_tokens": 20, "do_sample": False},
-            )
+        # Build KVBlock via standard path (INT8 quant) and use inject_and_generate().
+        # This tests the same code path as the real BEAM eval.
+        kv_q, scales = {}, {}
+        for l, (K, V) in kv_by_layer.items():
+            Kq, ks = quantize_int8(K.float())
+            Vq, vs = quantize_int8(V.float())
+            kv_q[l] = (Kq, Vq)
+            scales[l] = (ks, vs)
+        block = KVBlock.new(
+            model_id=memory.config.model_id,
+            session_id="oracle",
+            chunk_text=context,
+            token_count=n_ctx,
+            hidden_vecs=hidden_vecs,
+            kv_by_layer=kv_q,
+            quant_scales=scales,
+            original_positions=list(range(n_ctx)),
+        )
+        out = inject_and_generate(
+            adapter=adapter, blocks=[block],
+            current_tokens=q_tokens,
+            generation_kwargs={
+                "max_new_tokens": 20,
+                "do_sample": False,
+                "eos_token_id": adapter.tokenizer.eos_token_id,
+            },
+        )
 
         # Strip query from output
         answer_text = adapter.tokenizer.decode(
@@ -575,6 +555,11 @@ def run_beam(n: int = 20, model_key: str = "0.5b", text_rerank: bool = False):
             )
         else:
             gen_tokens = memory.adapter.tokenizer.encode(f"Q: {q.question}\nA:")
+
+        if not gen_tokens:
+            raise RuntimeError(
+                f"Empty generation tokens for question_id={q.question_id} question={q.question!r}"
+            )
 
         t0 = time.perf_counter()
         output = inject_and_generate(
