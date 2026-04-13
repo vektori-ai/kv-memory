@@ -1207,6 +1207,7 @@ async def main(args) -> None:
             "retrieval_layers": args.retrieval_layers,
             "retrieval_query_source": args.retrieval_query_source,
             "stage2_reranker": args.stage2_reranker,
+            "retrieval_rope_mode": args.retrieval_rope_mode,
             "token_budget": args.token_budget,
             "max_new_tokens": args.max_new_tokens,
         },
@@ -1301,6 +1302,7 @@ async def main(args) -> None:
             retrieval_layers=args.retrieval_layers,
             retrieval_query_source=args.retrieval_query_source,
             stage2_reranker=args.stage2_reranker,
+            retrieval_rope_mode=args.retrieval_rope_mode,
             token_budget=args.token_budget,
             importance_threshold=0.0 if args.synthetic else 0.3,
         )
@@ -1454,6 +1456,9 @@ if __name__ == "__main__":
     parser.add_argument("--stage2-reranker", default="mmr",
                         choices=["mmr", "qk"],
                         help="Stage 2 selector (default: mmr). qk ranks by pure Q.K relevance.")
+    parser.add_argument("--retrieval-rope-mode", default="native",
+                        choices=["native", "neutral"],
+                        help="Routing RoPE mode (default: native). neutral compares pre-RoPE Q/K.")
     parser.add_argument("--token-budget", type=int, default=2000,
                         help="Hard cap on injected tokens (default: 2000)")
     parser.add_argument("--rag-context-tokens", type=int, default=4096,

@@ -24,7 +24,7 @@ import numpy as np
 import torch
 
 from .base import BaseAdapter
-from ..core.retrieval import compute_q_vec
+from ..core.retrieval import compute_k_vec, compute_q_vec
 from ..storage.schema import KVBlock, GenerationOutput
 
 logger = logging.getLogger(__name__)
@@ -324,6 +324,7 @@ class HFAdapter(BaseAdapter):
         self,
         tokens: list[int],
         layers: list[int],
+        rope_mode: str = "native",
     ) -> dict[int, np.ndarray]:
         """
         Capture native attention-Q retrieval vectors for the current query.
@@ -333,8 +334,35 @@ class HFAdapter(BaseAdapter):
         position_embeddings to attention, then pools Q heads down to KV-head
         groups for GQA models so the vector dimension matches stored K vectors.
         """
+        return self._capture_attention_vecs(tokens, layers, vector_kind="q", rope_mode=rope_mode)
+
+    def capture_key_vecs(
+        self,
+        tokens: list[int],
+        layers: list[int],
+        rope_mode: str = "native",
+    ) -> dict[int, np.ndarray]:
+        """
+        Capture attention-K retrieval vectors directly from k_proj.
+
+        In native mode this matches the post-RoPE cache key direction. In neutral
+        mode it intentionally skips RoPE so routing compares pre-RoPE Q/K.
+        """
+        return self._capture_attention_vecs(tokens, layers, vector_kind="k", rope_mode=rope_mode)
+
+    def _capture_attention_vecs(
+        self,
+        tokens: list[int],
+        layers: list[int],
+        vector_kind: str,
+        rope_mode: str,
+    ) -> dict[int, np.ndarray]:
         if not tokens:
-            raise ValueError("capture_query_vecs() called with empty token list")
+            raise ValueError("attention vector capture called with empty token list")
+        if vector_kind not in {"q", "k"}:
+            raise ValueError(f"vector_kind must be 'q' or 'k', got {vector_kind!r}")
+        if rope_mode not in {"native", "neutral"}:
+            raise ValueError(f"rope_mode must be 'native' or 'neutral', got {rope_mode!r}")
 
         decoder_layers = self._decoder_layers()
         target_layers = [layer for layer in layers if 0 <= layer < len(decoder_layers)]
@@ -358,18 +386,27 @@ class HFAdapter(BaseAdapter):
 
                 head_dim = getattr(module, "head_dim", self.head_dim)
                 input_shape = hidden_states.shape[:-1]
-                q = module.q_proj(hidden_states).view(*input_shape, -1, head_dim).transpose(1, 2)
+                proj = module.q_proj if vector_kind == "q" else module.k_proj
+                states = proj(hidden_states).view(*input_shape, -1, head_dim).transpose(1, 2)
 
                 position_embeddings = kwargs.get("position_embeddings")
-                if position_embeddings is not None:
-                    q = self._apply_query_rope(module, q, position_embeddings)
+                if rope_mode == "native" and position_embeddings is not None:
+                    states = self._apply_attention_rope(
+                        module,
+                        states,
+                        position_embeddings,
+                        vector_kind=vector_kind,
+                    )
 
-                captured[layer_idx] = compute_q_vec(q[0], num_kv_heads=self.num_kv_heads)
+                if vector_kind == "q":
+                    captured[layer_idx] = compute_q_vec(states[0], num_kv_heads=self.num_kv_heads)
+                else:
+                    captured[layer_idx] = compute_k_vec(states[0])
 
             handles.append(attn.register_forward_pre_hook(_hook, with_kwargs=True))
 
         if not handles:
-            raise NotImplementedError("No attention q_proj modules found for query-Q capture")
+            raise NotImplementedError(f"No attention modules found for {vector_kind}-vector capture")
 
         try:
             device = self.model.device
@@ -543,22 +580,31 @@ class HFAdapter(BaseAdapter):
             f"Cannot locate decoder layers for {type(self.model).__name__}"
         )
 
-    def _apply_query_rope(self, attn_module, q: torch.Tensor, position_embeddings) -> torch.Tensor:
-        """Apply the model module's rotary helper to query states when available."""
+    def _apply_attention_rope(
+        self,
+        attn_module,
+        states: torch.Tensor,
+        position_embeddings,
+        vector_kind: str,
+    ) -> torch.Tensor:
+        """Apply the model module's rotary helper to query or key states when available."""
         try:
             import importlib
             model_module = importlib.import_module(type(attn_module).__module__)
             apply_rotary_pos_emb = getattr(model_module, "apply_rotary_pos_emb")
         except Exception:
-            return q
+            return states
 
         try:
             cos, sin = position_embeddings
-            q_rot, _ = apply_rotary_pos_emb(q, q, cos, sin)
-            return q_rot
+            if vector_kind == "q":
+                q_rot, _ = apply_rotary_pos_emb(states, states, cos, sin)
+                return q_rot
+            _, k_rot = apply_rotary_pos_emb(states, states, cos, sin)
+            return k_rot
         except Exception as exc:
-            logger.debug("Query RoPE application failed; using pre-RoPE Q: %s", exc)
-            return q
+            logger.debug("Attention RoPE application failed; using pre-RoPE %s: %s", vector_kind, exc)
+            return states
 
     def _manual_generate(
         self,

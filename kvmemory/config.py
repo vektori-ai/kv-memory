@@ -47,6 +47,10 @@ class KVMemoryConfig:
     retrieval_query_source: str = "k_vectors"
     # Stage 2 selector: "mmr" for relevance/diversity, "qk" for pure Q.K relevance.
     stage2_reranker: str = "mmr"
+    # RoPE mode for retrieval vectors:
+    # "native" uses the model/cache's normal post-RoPE Q/K vectors.
+    # "neutral" uses pre-RoPE Q/K vectors for routing only; stored KV payloads stay unchanged.
+    retrieval_rope_mode: str = "native"
 
     # Infrastructure
     qdrant_url: str = "localhost"

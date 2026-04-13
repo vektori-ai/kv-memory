@@ -344,8 +344,34 @@ async def run_write_pipeline(
             # Falls back to hidden states if retrieval_vec_source != "k_vectors".
             hidden_vecs: dict[int, np.ndarray] = {}
             use_k_vecs = getattr(config, "retrieval_vec_source", "k_vectors") == "k_vectors"
+            rope_mode = getattr(config, "retrieval_rope_mode", "native")
+            neutral_k_vecs: dict[int, np.ndarray] = {}
+            if use_k_vecs and rope_mode == "neutral":
+                capture_key_vecs = getattr(adapter, "capture_key_vecs", None)
+                if capture_key_vecs is not None:
+                    try:
+                        neutral_k_vecs = capture_key_vecs(
+                            tokens=chunk_tokens,
+                            layers=config.retrieval_layers,
+                            rope_mode="neutral",
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Neutral key-vector capture failed for chunk %d: %s; "
+                            "falling back to native cache K vectors",
+                            orig_index,
+                            exc,
+                        )
+                else:
+                    logger.warning(
+                        "Adapter %s does not expose capture_key_vecs(); "
+                        "falling back to native cache K vectors",
+                        type(adapter).__name__,
+                    )
             for layer in config.retrieval_layers:
-                if use_k_vecs and layer in kv_by_layer_float:
+                if use_k_vecs and layer in neutral_k_vecs:
+                    hidden_vecs[layer] = neutral_k_vecs[layer]
+                elif use_k_vecs and layer in kv_by_layer_float:
                     K, _ = kv_by_layer_float[layer]
                     hidden_vecs[layer] = compute_k_vec(K)
                 elif layer in hidden_by_layer:

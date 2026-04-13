@@ -734,17 +734,20 @@ Implementation checkpoint:
 ```text
 KVMemoryConfig.retrieval_query_source = "k_vectors" | "q_vectors"
 KVMemoryConfig.stage2_reranker        = "mmr" | "qk"
+KVMemoryConfig.retrieval_rope_mode    = "native" | "neutral"
 HFAdapter.capture_query_vecs()
+HFAdapter.capture_key_vecs()
 stage2_rerank_qk()
 BEAM CLI flags:
   --retrieval-query-source q_vectors
   --stage2-reranker qk
+  --retrieval-rope-mode neutral
 ```
 
 Local BEAM command for the routerless Q-K probe:
 
 ```powershell
-python -m tests.beam_eval --hf --scale 100K --n 5 --model .\models\Qwen2.5-7B-Instruct --dtype float16 --retrieval-layers 8 16 24 --capture-batch-size 1 --max-new-tokens 50 --retrieval-query-source q_vectors --stage2-reranker qk --output results_beam_local_100K_n5_qk.json
+python -m tests.beam_eval --hf --scale 100K --n 5 --model .\models\Qwen2.5-7B-Instruct --dtype float16 --retrieval-layers 8 16 24 --capture-batch-size 1 --max-new-tokens 50 --retrieval-query-source q_vectors --stage2-reranker qk --retrieval-rope-mode neutral --output results_beam_local_100K_n5_qk_neutral.json
 ```
 
 ## 17. Open Risks

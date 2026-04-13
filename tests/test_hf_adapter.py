@@ -401,8 +401,13 @@ class TestQueryVecCapture:
                 super().__init__()
                 self.head_dim = 1
                 self.q_proj = torch.nn.Linear(4, 4, bias=False)
+                self.k_proj = torch.nn.Linear(4, 2, bias=False)
                 with torch.no_grad():
                     self.q_proj.weight.copy_(torch.eye(4))
+                    self.k_proj.weight.copy_(torch.tensor([
+                        [1.0, 0.0, 0.0, 0.0],
+                        [0.0, 0.0, 1.0, 0.0],
+                    ]))
 
             def forward(self, hidden_states, position_embeddings=None, **kwargs):
                 return hidden_states, None
@@ -447,6 +452,13 @@ class TestQueryVecCapture:
         assert set(vecs) == {0}
         assert vecs[0].shape == (2,)
         np.testing.assert_allclose(vecs[0], expected, atol=1e-6)
+
+        key_vecs = adapter.capture_key_vecs(tokens=[1, 2], layers=[0], rope_mode="neutral")
+        expected_k = torch.tensor([1.0, 3.0], dtype=torch.float32)
+        expected_k = torch.nn.functional.normalize(expected_k, dim=0).numpy()
+        assert set(key_vecs) == {0}
+        assert key_vecs[0].shape == (2,)
+        np.testing.assert_allclose(key_vecs[0], expected_k, atol=1e-6)
 
 
 # ------------------------------------------------------------------

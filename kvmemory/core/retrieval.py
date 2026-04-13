@@ -151,7 +151,11 @@ def compute_query_vecs(
         capture_query_vecs = getattr(adapter, "capture_query_vecs", None)
         if capture_query_vecs is not None:
             try:
-                return capture_query_vecs(tokens=tokens, layers=config.retrieval_layers)
+                return capture_query_vecs(
+                    tokens=tokens,
+                    layers=config.retrieval_layers,
+                    rope_mode=getattr(config, "retrieval_rope_mode", "native"),
+                )
             except Exception as exc:
                 logger.warning(
                     "Q-vector query capture failed (%s); falling back to K-vector query capture",
@@ -517,6 +521,7 @@ def build_candidate_diagnostics(
         "query_source": getattr(config, "retrieval_query_source", "k_vectors"),
         "retrieval_vec_source": getattr(config, "retrieval_vec_source", "k_vectors"),
         "stage2_reranker": getattr(config, "stage2_reranker", "mmr"),
+        "retrieval_rope_mode": getattr(config, "retrieval_rope_mode", "native"),
         "top_candidates": diagnostic_rows,
         "selected_ids": selected_ids,
         "gold_in_stage1": bool(gold_rows),
