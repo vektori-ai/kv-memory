@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from kvmemory.config import KVMemoryConfig
 from kvmemory.core.retrieval import (
     _default_layer_weights,
+    build_candidate_diagnostics,
     compute_query_vecs,
     compute_q_vec,
     compute_retrieval_vec,
@@ -353,6 +354,85 @@ class TestStage2QK:
         )
 
         assert selected == ["small"]
+
+
+class TestCandidateDiagnostics:
+    def test_marks_gold_stage1_and_selected(self):
+        query = np.array([1.0, 0.0], dtype=np.float32)
+        candidates = [
+            {
+                "id": "answer",
+                "vector": {"layer_1": [1.0, 0.0]},
+                "payload": {
+                    "token_count": 10,
+                    "chunk_text": "The project deadline moved to March 31.",
+                    "importance_score": 0.7,
+                },
+            },
+            {
+                "id": "distractor",
+                "vector": {"layer_1": [0.0, 1.0]},
+                "payload": {
+                    "token_count": 10,
+                    "chunk_text": "The budget review is on Friday.",
+                    "importance_score": 0.5,
+                },
+            },
+        ]
+        mock_db = MagicMock()
+        mock_db.fetch_with_vectors.return_value = candidates
+        config = KVMemoryConfig(model_id="test", retrieval_layers=[1])
+
+        diag = build_candidate_diagnostics(
+            candidate_ids=["answer", "distractor"],
+            selected_ids=["answer"],
+            query_vecs={1: query},
+            config=config,
+            vector_db=mock_db,
+            question="What is the project deadline?",
+            gold_answer="March 31",
+        )
+
+        assert diag["candidate_count"] == 2
+        assert diag["gold_in_stage1"] is True
+        assert diag["gold_in_selected"] is True
+        assert diag["best_gold_stage1_rank"] == 1
+        assert diag["best_gold_rerank_rank"] == 1
+        assert diag["top_candidates"][0]["block_id"] == "answer"
+
+    def test_keeps_gold_row_even_below_top_n(self):
+        query = np.array([1.0, 0.0], dtype=np.float32)
+        candidates = [
+            {
+                "id": "top",
+                "vector": {"layer_1": [1.0, 0.0]},
+                "payload": {"token_count": 10, "chunk_text": "irrelevant top chunk"},
+            },
+            {
+                "id": "gold",
+                "vector": {"layer_1": [-1.0, 0.0]},
+                "payload": {"token_count": 10, "chunk_text": "Answer is March 31."},
+            },
+        ]
+        mock_db = MagicMock()
+        mock_db.fetch_with_vectors.return_value = candidates
+        config = KVMemoryConfig(model_id="test", retrieval_layers=[1])
+
+        diag = build_candidate_diagnostics(
+            candidate_ids=["top", "gold"],
+            selected_ids=["top"],
+            query_vecs={1: query},
+            config=config,
+            vector_db=mock_db,
+            question="What is the project deadline?",
+            gold_answer="March 31",
+            top_n=1,
+        )
+
+        returned_ids = [row["block_id"] for row in diag["top_candidates"]]
+        assert returned_ids == ["top", "gold"]
+        assert diag["gold_in_stage1"] is True
+        assert diag["gold_in_selected"] is False
 
 
 class TestRecallAt10:

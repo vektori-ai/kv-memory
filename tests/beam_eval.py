@@ -82,6 +82,9 @@ class BEAMResult:
     question: str = ""
     context: str = ""
     retrieved_chunks: list = field(default_factory=list)  # chunk texts that were injected
+    candidate_count: int = 0
+    selected_block_ids: list = field(default_factory=list)
+    retrieval_diagnostics: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -388,7 +391,11 @@ async def run_kv_memory_eval(
     rather than going through memory.generate(), which gives us fine-grained
     breakdown without modifying the public API.
     """
-    from kvmemory.core.retrieval import stage1_coarse, stage2_rerank
+    from kvmemory.core.retrieval import (
+        build_candidate_diagnostics,
+        stage1_coarse,
+        stage2_rerank,
+    )
     from kvmemory.core.injector import inject_and_generate
     from kvmemory.memory import _build_session_filter
 
@@ -604,6 +611,20 @@ async def run_kv_memory_eval(
         )
 
         em, f1 = score_answer(answer_text, q.gold_answer)
+        try:
+            retrieval_diagnostics = build_candidate_diagnostics(
+                candidate_ids=candidate_ids,
+                selected_ids=final_ids,
+                query_vecs=query_vecs,
+                config=memory.config,
+                vector_db=memory.vector_db,
+                question=q.question,
+                gold_answer=q.gold_answer,
+            )
+        except Exception as exc:
+            logger.warning("Failed to build retrieval diagnostics for %s: %s", q.question_id, exc)
+            retrieval_diagnostics = {"error": str(exc), "error_type": type(exc).__name__}
+
         if question_observer:
             question_observer.emit(
                 "score_done",
@@ -613,6 +634,16 @@ async def run_kv_memory_eval(
                 correct=em > 0 or f1 > 0.5,
                 predicted_answer=answer_text,
                 gold_answer=q.gold_answer,
+            )
+            question_observer.emit(
+                "retrieval_diagnostics_done",
+                benchmark="kv_memory",
+                candidate_count=len(candidate_ids),
+                selected_count=len(final_ids),
+                gold_in_stage1=retrieval_diagnostics.get("gold_in_stage1"),
+                gold_in_selected=retrieval_diagnostics.get("gold_in_selected"),
+                best_gold_rerank_rank=retrieval_diagnostics.get("best_gold_rerank_rank"),
+                best_gold_stage1_rank=retrieval_diagnostics.get("best_gold_stage1_rank"),
             )
 
         results.append(BEAMResult(
@@ -632,6 +663,9 @@ async def run_kv_memory_eval(
             question=q.question,
             context=q.context,
             retrieved_chunks=[b.chunk_text for b in blocks],
+            candidate_count=len(candidate_ids),
+            selected_block_ids=final_ids,
+            retrieval_diagnostics=retrieval_diagnostics,
         ))
 
         logger.debug(
@@ -1382,6 +1416,9 @@ def _save_results(path, kv_results, rag_results, sw_results,
             "rag_pred": rag.predicted_answer if rag else None,
             "rag_pass": rag.correct if rag else None,
             "retrieved_chunks": r.retrieved_chunks,
+            "candidate_count": r.candidate_count,
+            "selected_block_ids": r.selected_block_ids,
+            "retrieval_diagnostics": r.retrieval_diagnostics,
         })
     with open(hitl_path, "w") as f:
         json.dump(hitl, f, indent=2)

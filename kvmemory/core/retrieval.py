@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
@@ -422,6 +423,115 @@ def stage2_rerank(
     )
 
 
+def build_candidate_diagnostics(
+    candidate_ids: list[str],
+    selected_ids: list[str],
+    query_vecs: dict[int, np.ndarray],
+    config: "KVMemoryConfig",
+    vector_db: "VectorDB",
+    question: str = "",
+    gold_answer: str = "",
+    top_n: int = 20,
+) -> dict:
+    """
+    Build JSON-serializable retrieval diagnostics without fetching KV blobs.
+
+    The output explains whether the answer-looking chunk was absent from Stage 1,
+    present but ranked below selected chunks, or selected but still failed during
+    injection/generation.
+    """
+    if not candidate_ids:
+        return {
+            "candidate_count": 0,
+            "selected_count": len(selected_ids),
+            "query_source": getattr(config, "retrieval_query_source", "k_vectors"),
+            "stage2_reranker": getattr(config, "stage2_reranker", "mmr"),
+            "top_candidates": [],
+            "selected_ids": selected_ids,
+            "gold_in_stage1": False,
+            "gold_in_selected": False,
+            "best_gold_rerank_rank": None,
+        }
+
+    candidates = vector_db.fetch_with_vectors(config.model_id, candidate_ids)
+    layer_weights = _default_layer_weights(config.retrieval_layers)
+    stage1_rank = {block_id: idx + 1 for idx, block_id in enumerate(candidate_ids)}
+    selected_order = {block_id: idx + 1 for idx, block_id in enumerate(selected_ids)}
+
+    question_terms = set(_diagnostic_terms(question))
+    gold_terms = set(_diagnostic_terms(gold_answer))
+    gold_phrase = " ".join(_diagnostic_terms(gold_answer))
+
+    rows: list[dict] = []
+    for cand in candidates:
+        block_id = cand["id"]
+        payload = cand["payload"] or {}
+        chunk_text = str(payload.get("chunk_text", ""))
+        chunk_terms = set(_diagnostic_terms(chunk_text))
+        rel = _candidate_relevance(cand, query_vecs, layer_weights)
+        gold_overlap_terms = sorted(gold_terms & chunk_terms)
+        question_overlap_terms = sorted(question_terms & chunk_terms)
+        chunk_phrase = " ".join(_diagnostic_terms(chunk_text))
+        gold_substring = bool(gold_phrase and gold_phrase in chunk_phrase)
+
+        rows.append({
+            "block_id": block_id,
+            "stage1_rank": stage1_rank.get(block_id),
+            "selected": block_id in selected_order,
+            "selected_order": selected_order.get(block_id),
+            "relevance": round(rel, 6),
+            "token_count": int(payload.get("token_count", 0) or 0),
+            "importance_score": float(payload.get("importance_score", 0.0) or 0.0),
+            "question_overlap": round(
+                len(question_overlap_terms) / max(len(question_terms), 1),
+                6,
+            ),
+            "gold_overlap": round(len(gold_overlap_terms) / max(len(gold_terms), 1), 6),
+            "gold_substring": gold_substring,
+            "question_overlap_terms": question_overlap_terms[:20],
+            "gold_overlap_terms": gold_overlap_terms[:20],
+            "chunk_preview": chunk_text[:500],
+        })
+
+    rows.sort(key=lambda row: row["relevance"], reverse=True)
+    for idx, row in enumerate(rows, start=1):
+        row["rerank_rank"] = idx
+
+    diagnostic_rows = rows[:top_n]
+    keep_ids = {row["block_id"] for row in diagnostic_rows}
+    for row in rows[top_n:]:
+        should_keep = row["selected"] or row["gold_overlap"] > 0 or row["gold_substring"]
+        if should_keep and row["block_id"] not in keep_ids:
+            diagnostic_rows.append(row)
+            keep_ids.add(row["block_id"])
+
+    gold_rows = [
+        row for row in rows
+        if row["gold_overlap"] > 0 or row["gold_substring"]
+    ]
+    selected_gold_rows = [row for row in gold_rows if row["selected"]]
+
+    return {
+        "candidate_count": len(candidate_ids),
+        "selected_count": len(selected_ids),
+        "query_source": getattr(config, "retrieval_query_source", "k_vectors"),
+        "retrieval_vec_source": getattr(config, "retrieval_vec_source", "k_vectors"),
+        "stage2_reranker": getattr(config, "stage2_reranker", "mmr"),
+        "top_candidates": diagnostic_rows,
+        "selected_ids": selected_ids,
+        "gold_in_stage1": bool(gold_rows),
+        "gold_in_selected": bool(selected_gold_rows),
+        "best_gold_rerank_rank": min(
+            (row["rerank_rank"] for row in gold_rows),
+            default=None,
+        ),
+        "best_gold_stage1_rank": min(
+            (row["stage1_rank"] for row in gold_rows if row["stage1_rank"] is not None),
+            default=None,
+        ),
+    }
+
+
 # ------------------------------------------------------------------
 # Internal helpers
 # ------------------------------------------------------------------
@@ -449,3 +559,19 @@ def _default_layer_weights(retrieval_layers: list[int]) -> dict[int, float]:
     if n == 3:
         return dict(zip(retrieval_layers, [0.25, 0.50, 0.25]))
     return {layer: 1.0 / n for layer in retrieval_layers}
+
+
+_DIAGNOSTIC_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "can", "did", "do",
+    "for", "from", "how", "i", "in", "is", "it", "me", "my", "of", "on",
+    "or", "over", "such", "that", "the", "this", "to", "was", "were",
+    "what", "when", "where", "which", "who", "with", "you", "your",
+}
+
+
+def _diagnostic_terms(text: str) -> list[str]:
+    return [
+        token
+        for token in re.findall(r"[a-z0-9]+", text.lower())
+        if token not in _DIAGNOSTIC_STOPWORDS and len(token) > 1
+    ]
