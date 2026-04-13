@@ -750,6 +750,24 @@ Local BEAM command for the routerless Q-K probe:
 python -m tests.beam_eval --hf --scale 100K --n 5 --model .\models\Qwen2.5-7B-Instruct --dtype float16 --retrieval-layers 8 16 24 --capture-batch-size 1 --max-new-tokens 50 --retrieval-query-source q_vectors --stage2-reranker qk --retrieval-rope-mode neutral --output results_beam_local_100K_n5_qk_neutral.json
 ```
 
+Dynamic memory checkpoint:
+
+```text
+kvmemory.core.dynamic_memory.extract_fact_claims() adds a lightweight
+entity.attribute=value layer for date/price-like claims.
+
+VectorDB payloads now include:
+  fact_keys
+  fact_claims
+
+The write path looks up prior same-key claims with VectorDB.find_fact_claims()
+and annotates new claims with conflict metadata before upsert.
+
+This is not yet an LLM-grade extractor or query-time answer resolver. It is the
+minimal indexed evidence layer needed to debug changing memory without scanning
+all chunks.
+```
+
 ## 17. Open Risks
 
 ```text

@@ -486,6 +486,8 @@ def build_candidate_diagnostics(
             "relevance": round(rel, 6),
             "token_count": int(payload.get("token_count", 0) or 0),
             "importance_score": float(payload.get("importance_score", 0.0) or 0.0),
+            "fact_keys": payload.get("fact_keys", []),
+            "fact_claims": payload.get("fact_claims", []),
             "question_overlap": round(
                 len(question_overlap_terms) / max(len(question_terms), 1),
                 6,

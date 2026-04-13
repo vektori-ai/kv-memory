@@ -381,6 +381,41 @@ class VectorDB:
             except Exception as e:
                 logger.debug("increment_access_count failed for %s: %s", bid, e)
 
+    def find_fact_claims(
+        self,
+        model_id: str,
+        claim_key: str,
+        session_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        """Fetch stored fact claims for one entity.attribute key."""
+        must: list[FieldCondition] = [
+            FieldCondition(key="model_id", match=MatchValue(value=model_id)),
+            FieldCondition(key="fact_keys", match=MatchValue(value=claim_key)),
+        ]
+        if session_id:
+            must.append(FieldCondition(key="session_id", match=MatchValue(value=session_id)))
+
+        try:
+            records, _ = self.client.scroll(
+                collection_name=self._collection_name(model_id),
+                scroll_filter=Filter(must=must),
+                limit=limit,
+                with_payload=True,
+                with_vectors=False,
+            )
+        except Exception as exc:
+            logger.debug("find_fact_claims failed for %s: %s", claim_key, exc)
+            return []
+
+        claims: list[dict] = []
+        for record in records:
+            payload = record.payload or {}
+            for claim in payload.get("fact_claims", []) or []:
+                if claim.get("claim_key") == claim_key:
+                    claims.append(claim)
+        return claims
+
     def list_collections(self) -> list[dict]:
         """Return lightweight collection metadata for dashboard browsing."""
         collections = []

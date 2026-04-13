@@ -33,6 +33,7 @@ from ..core.importance import (
     compute_chunk_loss,
     score_importance,
 )
+from ..core.dynamic_memory import extract_fact_claims, find_conflicts
 from ..core.retrieval import compute_retrieval_vec, compute_k_vec
 from ..observability import RunObserver
 from ..storage.kv_store import KVStore
@@ -477,6 +478,26 @@ async def run_write_pipeline(
                 if event_observer:
                     trace_payload.update(event_observer.context_fields)
                 trace_payload.update(trace_context or {})
+                if getattr(config, "dynamic_claim_extraction", True):
+                    claims = extract_fact_claims(chunk_text)
+                    fact_claims = []
+                    prior_cache: dict[str, list[dict]] = {}
+                    for claim in claims:
+                        prior_claims = prior_cache.get(claim.claim_key)
+                        if prior_claims is None:
+                            prior_claims = vector_db.find_fact_claims(
+                                model_id=config.model_id,
+                                claim_key=claim.claim_key,
+                                session_id=session_id,
+                            )
+                            prior_cache[claim.claim_key] = prior_claims
+                        payload_claim = claim.to_payload()
+                        payload_claim["conflicts"] = find_conflicts(claim, prior_claims)
+                        prior_claims.append(payload_claim)
+                        fact_claims.append(payload_claim)
+                    if fact_claims:
+                        trace_payload["fact_claims"] = fact_claims
+                        trace_payload["fact_keys"] = sorted({claim["claim_key"] for claim in fact_claims})
                 vector_db.upsert(
                     model_id=config.model_id,
                     block_id=block.block_id,

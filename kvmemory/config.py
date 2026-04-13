@@ -51,6 +51,8 @@ class KVMemoryConfig:
     # "native" uses the model/cache's normal post-RoPE Q/K vectors.
     # "neutral" uses pre-RoPE Q/K vectors for routing only; stored KV payloads stay unchanged.
     retrieval_rope_mode: str = "native"
+    # Extract lightweight structured claims into vector payloads for conflict/temporal diagnostics.
+    dynamic_claim_extraction: bool = True
 
     # Infrastructure
     qdrant_url: str = "localhost"
