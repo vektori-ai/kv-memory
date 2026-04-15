@@ -313,6 +313,88 @@ setInterval(loadRuns, 10000);
 """
 
 
+_DASHBOARD_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>KV Memory Flow</title>
+<style>
+:root{--bg:#f6f7f9;--panel:#fff;--ink:#191919;--muted:#667085;--line:#d8dde6;--soft:#eef1f5;--green:#0f766e;--red:#be123c;--amber:#a16207;--blue:#2563eb}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 Inter,Segoe UI,system-ui,sans-serif;letter-spacing:0}button,select{font:inherit;letter-spacing:0}
+header{height:58px;display:flex;gap:12px;align-items:center;padding:12px 18px;background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:2}
+.mark{width:18px;height:18px;border-radius:4px;border:1px solid var(--line);background:linear-gradient(135deg,var(--green),var(--red))}h1{font-size:18px;margin:0}.note{color:var(--muted);overflow-wrap:anywhere}.refresh{margin-left:auto;border:1px solid var(--line);background:var(--panel);border-radius:6px;padding:7px 12px;cursor:pointer}
+.layout{display:grid;grid-template-columns:minmax(260px,310px) 1fr;min-height:calc(100vh - 58px)}aside{padding:14px;background:#fbfcfd;border-right:1px solid var(--line);overflow:auto}main{padding:18px;overflow:auto}.eyebrow{font-size:12px;color:var(--muted);margin:0 0 8px}
+.run{width:100%;display:block;text-align:left;border:1px solid var(--line);background:var(--panel);border-radius:8px;padding:10px;margin:0 0 8px;cursor:pointer}.run:hover,.run.active{border-color:var(--green)}.rid{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px;overflow-wrap:anywhere}.rmeta{color:var(--muted);font-size:12px;margin-top:4px;overflow-wrap:anywhere}.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--amber);margin-right:7px}.dot.completed{background:var(--green)}.dot.failed{background:var(--red)}
+.empty,.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px}.empty{min-height:240px;display:grid;place-items:center;text-align:center;color:var(--muted);padding:20px}.panel{padding:14px;margin-bottom:14px}h2{font-size:16px;margin:0 0 10px}.sub{color:var(--muted);font-size:12px}.head{display:flex;justify-content:space-between;gap:12px;align-items:baseline;margin-bottom:10px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(135px,1fr));gap:8px}.metric,.step,.box,.row{border:1px solid var(--line);border-radius:8px;background:#fcfcfd;padding:10px}.label{color:var(--muted);font-size:12px;margin-bottom:6px}.val{font-size:23px;font-weight:800;overflow-wrap:anywhere}.help{color:var(--muted);font-size:12px;margin-top:3px}.green{color:var(--green)}.red{color:var(--red)}.amber{color:var(--amber)}.blue{color:var(--blue)}
+.flow{display:grid;grid-template-columns:repeat(5,minmax(120px,1fr));gap:8px;margin-top:10px}.step{min-height:82px}.split{display:grid;grid-template-columns:minmax(230px,.75fr) minmax(320px,1.25fr);gap:12px}.list{display:grid;gap:8px}.row{overflow-wrap:anywhere}.bid{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--green);font-size:12px}.chip{display:inline-flex;min-height:22px;align-items:center;border:1px solid var(--line);background:var(--soft);border-radius:6px;padding:2px 7px;margin:2px 4px 2px 0;font-size:12px}.pick{background:#fce7f3;border-color:#f9a8d4;color:var(--red)}.hit{background:#ccfbf1;border-color:#5eead4;color:var(--green)}.warn{background:#fef3c7;border-color:#fcd34d;color:var(--amber)}
+.qbar{display:grid;grid-template-columns:minmax(220px,1fr) auto auto;gap:8px;align-items:center}select{width:100%;min-height:38px;border:1px solid var(--line);border-radius:6px;background:var(--panel);padding:7px 9px}.answers{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:10px 0}table{width:100%;border-collapse:collapse;table-layout:fixed}th,td{text-align:left;vertical-align:top;border-bottom:1px solid var(--line);padding:8px;overflow-wrap:anywhere}th{font-size:12px;color:var(--muted)}tr:last-child td{border-bottom:0}
+@media(max-width:900px){.layout{grid-template-columns:1fr}aside{border-right:0;border-bottom:1px solid var(--line);max-height:280px}.flow{grid-template-columns:repeat(2,1fr)}.split,.answers,.qbar{grid-template-columns:1fr}main{padding:12px}}
+</style>
+</head>
+<body>
+<header><img class="mark" alt="" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="/><h1>KV Memory Flow</h1><span id="note" class="note">Pick a run</span><button class="refresh" onclick="loadRuns()">Refresh</button></header>
+<div class="layout"><aside><p class="eyebrow">Runs</p><div id="runs">Loading...</div></aside><main id="main"><div class="empty">Pick a run to trace write, retrieval, rerank, and injection.</div></main></div>
+<script>
+const st={runs:[],id:null,trace:null,qid:null};
+const x=v=>String(v??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'","&#39;");
+const f=(v,d=0)=>v===null||v===undefined||v===''?'-':(Number.isFinite(Number(v))?Number(v).toFixed(d):x(v));
+const pct=v=>v===null||v===undefined||v===''?'-':f(Number(v)*100,0)+'%';
+const ms=v=>v===null||v===undefined||v===''?'-':f(v,0)+' ms';
+const sid=v=>{v=String(v||'');return v.length>12?v.slice(0,8)+'...'+v.slice(-4):(v||'-')};
+const model=r=>String(r?.config?.model||r?.config?.model_id||'unknown').split(/[\\/]/).pop();
+const chip=(t,c='')=>`<span class="chip ${c}">${x(t)}</span>`;
+const metric=(l,v,h='',c='')=>`<div class="metric"><div class="label">${x(l)}</div><div class="val ${c}">${v}</div>${h?`<div class="help">${x(h)}</div>`:''}</div>`;
+const step=(l,v,h='',c='')=>`<div class="step"><div class="label">${x(l)}</div><div class="val ${c}">${v}</div><div class="help">${x(h)}</div></div>`;
+
+async function loadRuns(){
+  const el=document.getElementById('runs'); el.innerHTML='Loading...';
+  const data=await (await fetch('/api/runs')).json(); st.runs=data.runs||[];
+  el.innerHTML=st.runs.length?st.runs.map(r=>`<button class="run ${r.run_id===st.id?'active':''}" onclick="selectRun('${x(r.run_id)}')"><div><span class="dot ${x(r.status)}"></span><span class="rid">${x(sid(r.run_id))}</span></div><div class="rmeta">${x(model(r))}</div><div class="rmeta">${x(r.started_at?new Date(r.started_at*1000).toLocaleString():'')}${r.summary?.kv_metrics?.overall_f1==null?'':' | F1 '+pct(r.summary.kv_metrics.overall_f1)}</div></button>`).join(''):'<div class="empty">No runs yet.</div>';
+}
+async function selectRun(id){
+  st.id=id;st.qid=null;document.getElementById('main').innerHTML='<div class="empty">Loading trace...</div>';await loadRuns();
+  const [rr,er]=await Promise.all([fetch(`/api/runs/${encodeURIComponent(id)}`),fetch(`/api/runs/${encodeURIComponent(id)}/events`)]);
+  st.trace=buildTrace(await rr.json(),(await er.json()).events||[]);st.qid=st.trace.questions[0]?.question_id||null;render();
+}
+function buildTrace(run,events){
+  const made=new Map(),stored=[],skips={},layers={},qs=new Map(),order=[];
+  const key=e=>(e.question_id||'')+':'+(e.chunk_index||'');
+  const addq=id=>{id=String(id||`q_${order.length+1}`);if(!qs.has(id)){qs.set(id,{question_id:id,question:'',question_type:'',gold_answer:'',predicted_answer:'',f1_score:null,em_score:null,correct:null,candidate_count:0,selected_count:0,selected_block_ids:[],retrieved_chunks:[],retrieval_diagnostics:{},stage1:{},stage2:{},fetch:{},generation:{}});order.push(id)}return qs.get(id)};
+  for(const e of events){
+    if(e.type==='write_chunk_created') made.set(key(e),e);
+    if(e.type==='write_chunk_skipped') skips[e.reason||'unknown']=(skips[e.reason||'unknown']||0)+1;
+    if(e.type==='write_chunk_stored'){const m=made.get(key(e))||{};(e.retrieval_layers||[]).forEach(l=>layers[l]=(layers[l]||0)+1);stored.push({block_id:e.block_id,question_id:e.question_id,chunk_index:e.chunk_index,total_chunks:e.total_chunks,token_count:e.token_count,importance_score:e.importance_score,retrieval_layers:e.retrieval_layers||[],chunk_preview:m.chunk_preview,seq:e.seq})}
+  }
+  for(const [i,r] of (run.summary?.kv_results||[]).entries()){const d=r.retrieval_diagnostics||{},q=addq(r.question_id||`summary_${i+1}`),sel=r.selected_block_ids||d.selected_ids||[];Object.assign(q,{question:r.question||q.question,question_type:r.question_type||q.question_type,gold_answer:r.gold_answer||'',predicted_answer:r.predicted_answer||'',f1_score:r.f1_score,em_score:r.em_score,correct:r.correct,candidate_count:r.candidate_count||d.candidate_count||0,selected_count:sel.length||d.selected_count||0,selected_block_ids:sel,retrieved_chunks:r.retrieved_chunks||[],retrieval_diagnostics:d,latency_ms:r.latency_ms,prefill_tokens:r.prefill_tokens});q.stage1.duration_ms=r.stage1_ms;q.stage2.duration_ms=r.stage2_ms;q.fetch.duration_ms=r.fetch_ms;q.generation.duration_ms=r.generate_ms}
+  const types=new Set(['question_started','retrieval_stage1_done','retrieval_stage2_done','kv_fetch_done','generation_done','score_done','retrieval_diagnostics_done','question_finished']);
+  for(const e of events){if(!types.has(e.type)||e.question_id==null)continue;const q=addq(e.question_id);if(e.question_type&&!q.question_type)q.question_type=e.question_type;
+    if(e.type==='question_started')q.question=e.question||q.question;
+    if(e.type==='retrieval_stage1_done'){q.stage1={duration_ms:e.duration_ms,candidate_count:e.candidate_count,query_token_count:e.query_token_count||e.retrieval_query_token_count};q.candidate_count=e.candidate_count||q.candidate_count}
+    if(e.type==='retrieval_stage2_done'){const sel=e.selected_ids||q.selected_block_ids||[];q.stage2={duration_ms:e.duration_ms,selected_count:e.selected_count,selected_ids:sel};q.selected_block_ids=sel;q.selected_count=e.selected_count||sel.length}
+    if(e.type==='kv_fetch_done')q.fetch={duration_ms:e.duration_ms,block_count:e.block_count,block_ids:e.block_ids,token_count:e.token_count};
+    if(e.type==='generation_done')q.generation={duration_ms:e.duration_ms,output_chars:e.output_chars};
+    if(e.type==='score_done'){q.em_score=e.em_score;q.f1_score=e.f1_score;q.correct=e.correct;q.predicted_answer=e.predicted_answer||q.predicted_answer;q.gold_answer=e.gold_answer||q.gold_answer}
+    if(e.type==='retrieval_diagnostics_done')Object.assign(q.retrieval_diagnostics,{candidate_count:e.candidate_count,selected_count:e.selected_count,gold_in_stage1:e.gold_in_stage1,gold_in_selected:e.gold_in_selected,best_gold_rerank_rank:e.best_gold_rerank_rank,best_gold_stage1_rank:e.best_gold_stage1_rank});
+    if(e.type==='question_finished'){q.latency_ms=e.latency_ms||q.latency_ms;q.prefill_tokens=e.prefill_tokens||q.prefill_tokens}
+  }
+  const ids=new Set(stored.map(b=>b.block_id).filter(Boolean));
+  return {run,events:{count:events.length},ingest:{before:0,after:ids.size,created:made.size,stored:stored.length,skipped:Object.values(skips).reduce((a,b)=>a+b,0),skips,layers,tokens:stored.reduce((a,b)=>a+Number(b.token_count||0),0),blocks:stored.slice(0,200)},questions:order.map(id=>{const q=qs.get(id),d=q.retrieval_diagnostics||{};q.candidate_count=q.candidate_count||d.candidate_count||0;q.selected_count=q.selected_count||d.selected_count||(q.selected_block_ids||[]).length;q.top_candidates=d.top_candidates||[];q.gold_in_stage1=d.gold_in_stage1;q.gold_in_selected=d.gold_in_selected;return q})};
+}
+const qsel=()=>st.trace.questions.find(q=>q.question_id===st.qid)||st.trace.questions[0]||null;
+function render(){const t=st.trace,r=t.run,ing=t.ingest,q=qsel();document.getElementById('note').textContent=`${r.status||'run'} | ${model(r)} | ${t.events.count} events`;document.getElementById('main').innerHTML=overview(t,q)+ingestion(ing)+retrieval(t,q)}
+function overview(t,q){const m=t.run.summary?.kv_metrics||{},ing=t.ingest,inj=q?.fetch?.block_count??q?.selected_count??0,rerank=String(t.run.config?.stage2_reranker||'mmr').toUpperCase();return `<section class="panel"><div class="head"><div><h2>Run ${x(sid(t.run.run_id))}</h2><div class="sub">${x(t.run.metadata?.session_id||'')}</div></div><div class="sub">${x(t.run.status||'')}</div></div><div class="grid">${metric('KV F1',pct(m.overall_f1),'answer quality','green')}${metric('Avg latency',ms(m.avg_latency_ms),'read path')}${metric('Questions',f(t.run.summary?.question_count??t.questions.length),'scored')}${metric('Stored blocks',f(ing.after),'run-local')}</div><div class="flow">${step('Before ingestion',f(ing.before),'run-local blocks')}${step('After write',f(ing.after),f(ing.tokens)+' tokens','green')}${step('Stage 1 candidates',f(q?.candidate_count),'from stored blocks','blue')}${step(rerank+' pick',f(q?.selected_count),'selected for injection','amber')}${step('Injected',f(inj),f(q?.fetch?.token_count)+' KV tokens','red')}</div></section>`}
+function ingestion(ing){const reasons=Object.entries(ing.skips||{}),layers=Object.entries(ing.layers||{}).map(([l,c])=>chip('L'+l+': '+c)).join('')||'<span class="sub">No stored layers yet</span>',blocks=(ing.blocks||[]).slice(0,10).map(b=>`<div class="row"><div><span class="bid">${x(sid(b.block_id))}</span> ${chip('q '+(b.question_id??'-'))} ${chip(f(b.token_count)+' tokens')}</div><div class="sub">${x(b.chunk_preview||'No chunk preview captured')}</div><div>${(b.retrieval_layers||[]).map(l=>chip('L'+l)).join('')}</div></div>`).join('')||'<div class="sub">No KV blocks written in this run.</div>';return `<section class="panel"><div class="head"><div><h2>Ingestion</h2><div class="sub">chunk -> capture -> KV store -> vector index</div></div><div class="sub">${f(ing.created)} chunks seen</div></div><div class="split"><div><div class="grid">${metric('Stored',f(ing.stored),'KV blocks','green')}${metric('Skipped',f(ing.skipped),'gates and duplicates',ing.skipped?'amber':'')}</div><h2 style="margin-top:12px">Skipped reasons</h2><div class="list">${reasons.length?reasons.map(([r,c])=>`<div class="row"><span>${x(r)}</span><strong style="float:right">${f(c)}</strong></div>`).join(''):'<div class="sub">No skipped chunks.</div>'}</div><h2 style="margin-top:12px">Layers</h2><div>${layers}</div></div><div><h2>Stored blocks</h2><div class="list">${blocks}</div></div></div></section>`}
+function retrieval(t,q){if(!q)return '<section class="panel"><h2>Retrieval</h2><div class="sub">No question traces in this run.</div></section>';const opts=t.questions.map(it=>`<option value="${x(it.question_id)}" ${it.question_id===q.question_id?'selected':''}>${x(it.question_id+' | '+(it.question||it.question_type||'question'))}</option>`).join('');return `<section class="panel"><h2>Retrieval</h2><div class="qbar"><select onchange="st.qid=this.value;render()">${opts}</select>${chip('F1 '+pct(q.f1_score),q.correct?'hit':'warn')}${chip(f(q.candidate_count)+' of '+f(t.ingest.after)+' candidates')}</div><p><strong>Query</strong><br><span class="sub">${x(q.question||'No question text captured')}</span></p><div class="answers"><div class="box"><strong>Gold</strong><br>${x(q.gold_answer||'-')}</div><div class="box"><strong>Predicted</strong><br>${x(q.predicted_answer||'-')}</div></div><div class="grid">${metric('Stage 1',ms(q.stage1?.duration_ms),f(q.stage1?.query_token_count)+' query tokens')}${metric('Rerank',ms(q.stage2?.duration_ms),f(q.selected_count)+' selected')}${metric('Fetch',ms(q.fetch?.duration_ms),f(q.fetch?.block_count)+' blocks')}${metric('Inject + generate',ms(q.generation?.duration_ms),f(q.generation?.output_chars)+' chars')}</div><div style="height:12px"></div>${candidates(q)}</section>`}
+function candidates(q){const rows=q.top_candidates||[],sel=new Set(q.selected_block_ids||q.retrieval_diagnostics?.selected_ids||[]);if(!rows.length)return '<div class="empty">No candidate diagnostics captured for this question.</div>';return `<div style="overflow-x:auto"><table><thead><tr><th>Stage 1</th><th>Rerank</th><th>Score</th><th>Answer</th><th>Block</th><th>Chunk</th></tr></thead><tbody>${rows.map(r=>{const picked=r.selected||sel.has(r.block_id),hit=r.gold_substring||Number(r.gold_overlap||0)>0;return `<tr><td>#${f(r.stage1_rank)}</td><td>#${f(r.rerank_rank)}</td><td>${f(r.relevance,3)}</td><td>${hit?chip('match','hit'):chip('no match')}</td><td><div class="bid">${x(sid(r.block_id))}</div>${picked?chip('picked','pick'):chip('not picked')} ${chip(f(r.token_count)+' tokens')} ${r.importance_score==null?'':chip('importance '+f(r.importance_score,2))}</td><td>${x(r.chunk_preview||'')}<div class="sub">${(r.gold_overlap_terms||[]).map(x).join(', ')}</div></td></tr>`}).join('')}</tbody></table></div>`}
+loadRuns();
+</script>
+</body>
+</html>
+"""
+
+
 def create_app(
     *,
     obs_dir: str = ".kvmem_obs",
@@ -490,7 +572,7 @@ def main() -> None:
         qdrant_url=args.qdrant_url,
         qdrant_port=args.qdrant_port,
     )
-    print(f"Dashboard → http://{args.host}:{args.port}")
+    print(f"Dashboard -> http://{args.host}:{args.port}")
     uvicorn.run(app, host=args.host, port=args.port)
 
 
